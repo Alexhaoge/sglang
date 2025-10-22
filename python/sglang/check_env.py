@@ -56,9 +56,7 @@ class BaseEnv:
     """Base class for environment check"""
 
     def __init__(self):
-        self.driver_info = {}
         self.package_list = PACKAGE_LIST
-        self.env_info = OrderedDict()
 
     @abstractmethod
     def get_info(self) -> dict:
@@ -110,7 +108,7 @@ class BaseEnv:
         env_info.update(self.get_package_versions())
         env_info.update(self.get_topology())
         env_info.update(self.get_hypervisor_vendor())
-        env_info["ulimit soft"] = self.get_ulimit_soft()
+        env_info.update(self.get_ulimit_soft())
 
         for k, v in env_info.items():
             print(f"{k}: {v}")
