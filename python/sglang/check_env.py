@@ -83,6 +83,32 @@ class BaseEnv:
                 versions[package_name] = "Module Not Found"
         return versions
 
+    def get_device_info(self):
+        """
+        Get information about available GPU devices.
+        """
+        devices = defaultdict(list)
+        capabilities = defaultdict(list)
+        for k in range(torch.cuda.device_count()):
+            devices[torch.cuda.get_device_name(k)].append(str(k))
+            capability = torch.cuda.get_device_capability(k)
+            capabilities[f"{capability[0]}.{capability[1]}"].append(str(k))
+
+        gpu_info = {}
+        for name, device_ids in devices.items():
+            gpu_info[f"GPU {','.join(device_ids)}"] = name
+
+        if len(capabilities) == 1:
+            # All GPUs have the same compute capability
+            cap, gpu_ids = list(capabilities.items())[0]
+            gpu_info[f"GPU {','.join(gpu_ids)} Compute Capability"] = cap
+        else:
+            # GPUs have different compute capabilities
+            for cap, gpu_ids in capabilities.items():
+                gpu_info[f"GPU {','.join(gpu_ids)} Compute Capability"] = cap
+
+        return gpu_info
+
     def get_hypervisor_vendor(self) -> dict:
         try:
             output = subprocess.check_output(["lscpu"], text=True)
@@ -121,36 +147,10 @@ class GPUEnv(BaseEnv):
         cuda_info = {"CUDA available": torch.cuda.is_available()}
 
         if cuda_info["CUDA available"]:
-            cuda_info.update(self._get_gpu_info())
+            cuda_info.update(self.get_device_info())
             cuda_info.update(self._get_cuda_version_info())
 
         return cuda_info
-
-    def _get_gpu_info(self):
-        """
-        Get information about available GPUs.
-        """
-        devices = defaultdict(list)
-        capabilities = defaultdict(list)
-        for k in range(torch.cuda.device_count()):
-            devices[torch.cuda.get_device_name(k)].append(str(k))
-            capability = torch.cuda.get_device_capability(k)
-            capabilities[f"{capability[0]}.{capability[1]}"].append(str(k))
-
-        gpu_info = {}
-        for name, device_ids in devices.items():
-            gpu_info[f"GPU {','.join(device_ids)}"] = name
-
-        if len(capabilities) == 1:
-            # All GPUs have the same compute capability
-            cap, gpu_ids = list(capabilities.items())[0]
-            gpu_info[f"GPU {','.join(gpu_ids)} Compute Capability"] = cap
-        else:
-            # GPUs have different compute capabilities
-            for cap, gpu_ids in capabilities.items():
-                gpu_info[f"GPU {','.join(gpu_ids)} Compute Capability"] = cap
-
-        return gpu_info
 
     def _get_cuda_version_info(self):
         """
@@ -231,14 +231,14 @@ class GPUEnv(BaseEnv):
             return {}
 
 
-class ROCmEnv(GPUEnv):
+class HIPEnv(BaseEnv):
     """Environment checker for ROCm/HIP"""
 
     def get_info(self):
         cuda_info = {"ROCM available": torch.cuda.is_available()}
 
         if cuda_info["ROCM available"]:
-            cuda_info.update(self._get_gpu_info())
+            cuda_info.update(self.get_device_info())
             cuda_info.update(self._get_cuda_version_info())
 
         return cuda_info
@@ -321,9 +321,10 @@ class NPUEnv(BaseEnv):
 
         return cuda_info
 
-    def _get_npu_info(self):
+    def get_device_info(self):
         """
         Get information about available NPUs.
+        Need to override due to torch_npu interface differences.
         """
         devices = defaultdict(list)
         for k in range(torch.npu.device_count()):
@@ -418,7 +419,7 @@ if __name__ == "__main__":
     if is_cuda_v2():
         env = GPUEnv()
     elif is_hip():
-        env = ROCmEnv()
+        env = HIPEnv()
     elif is_npu():
         env = NPUEnv()
     env.check_env()
