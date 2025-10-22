@@ -316,7 +316,7 @@ class NPUEnv(BaseEnv):
     def get_info(self):
         cuda_info = {"NPU available": torch.npu.is_available()}
         if cuda_info["NPU available"]:
-            cuda_info.update(self._get_npu_info())
+            cuda_info.update(self.get_device_info())
             cuda_info.update(self._get_cann_version_info())
 
         return cuda_info
