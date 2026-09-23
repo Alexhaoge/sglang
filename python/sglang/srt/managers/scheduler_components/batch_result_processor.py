@@ -466,17 +466,17 @@ class SchedulerBatchResultProcessor:
                             if self.stream_queue is not None:
                                 self.stream_queue.pop(req.rid, None)
                         else:
-                            # Keep the prefix cached for the next call with
-                            # this rid, but give back the req-pool slot.
+                            # A resumable stream is paused, not done: park it
+                            # exactly like a chunked prefill between chunks.
+                            # cache_unfinished_req hands the KV to the prefix
+                            # cache and frees the duplicate; the req-pool row
+                            # stays bound to this Req so the next call for this
+                            # rid reuses it (ReqToTokenPool.alloc reuses a row
+                            # whose Req still holds KV).  Freeing the row here
+                            # would strand the KV it maps to -- nothing else
+                            # ever frees it -- and the pool would grow until
+                            # the scheduler could not admit another request.
                             maybe_cache_unfinished_req(req, self.tree_cache)
-                            self.req_to_token_pool.free(req)
-                            if (
-                                self.stream_queue is not None
-                                and req.rid in self.stream_queue
-                            ):
-                                self.stream_queue[req.rid].prefix_indices = (
-                                    req.prefix_indices
-                                )
                     else:
                         maybe_cache_unfinished_req(req, self.tree_cache)
                 else:
