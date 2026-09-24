@@ -282,7 +282,19 @@ class SchedulerOutputStreamer:
                 if req.return_logprob_len is not None
                 else req_origin_len
             )
-            assert return_logprob_len <= req_origin_len
+            # Guaranteed by the per-rid radix namespace set in
+            # Scheduler.resume(): a stream only matches its own prefix, which
+            # ends at or before the previous call's last token.  If this ever
+            # fires, some of the tokens this call sent were served from cache
+            # and have no logits -- returning the short slice would silently
+            # hand back fewer labels than tokens, so fail loudly instead.
+            assert return_logprob_len <= req_origin_len, (
+                f"guard stream {req.rid}: asked for logits of the last "
+                f"{return_logprob_len} tokens but only {req_origin_len} were "
+                f"computed this pass (prefix cache covered the rest); "
+                f"origin_len={len(req.origin_input_ids)}, "
+                f"extra_key={req.extra_key!r}"
+            )
             start = req_origin_len - return_logprob_len
 
             if req.finished():

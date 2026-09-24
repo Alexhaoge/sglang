@@ -2742,6 +2742,25 @@ class Scheduler(
         tokens the caller wants logits for.
         """
         if recv_req.rid not in self.stream_queue:
+            # Keep every stream on its own branch of the radix tree.
+            #
+            # Two streams can carry byte-identical text.  If they shared a
+            # branch, a resumed call could match a cached prefix that already
+            # covers the tokens it just sent -- those tokens would not be
+            # recomputed, and the classification logits exist only for tokens
+            # computed in this forward pass (KV is cached, head outputs are
+            # not).  The call would then return fewer labels than tokens, or
+            # trip the length check in _stream_output_guard.
+            #
+            # Namespacing by rid leaves intra-stream reuse (the whole point of
+            # `resumable`) untouched: a stream only ever matches the prefix it
+            # inserted itself, which ends at most at the previous call's last
+            # token, so every newly sent token is always recomputed.
+            req.extra_key = (
+                f"guard:{recv_req.rid}"
+                if req.extra_key is None
+                else f"{req.extra_key}|guard:{recv_req.rid}"
+            )
             self.stream_queue[recv_req.rid] = req
             return req
         existing_req = self.stream_queue[recv_req.rid]
