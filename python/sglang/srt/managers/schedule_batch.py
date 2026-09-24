@@ -1638,6 +1638,13 @@ class Req(ReqDllmMixin):
         max_prefix_len = input_len - 1
         if self.return_logprob and self.logprob_start_len >= 0:
             max_prefix_len = min(max_prefix_len, self.logprob_start_len)
+        # Qwen3Guard-Stream, for the same reason as logprob_start_len above: a
+        # classification head only runs on tokens computed in this forward
+        # pass. KV for a cached prefix is reusable, head outputs are not. So
+        # the match must stop before the tokens this call wants labels for --
+        # otherwise they are never recomputed and their labels do not exist.
+        if self.return_logprob_len is not None:
+            max_prefix_len = min(max_prefix_len, input_len - self.return_logprob_len)
         return max(max_prefix_len, 0)
 
     # Based on https://github.com/vllm-project/vllm/blob/7a64d24aad69e4d2548aa0bf528d9fe63428ab01/vllm/transformers_utils/detokenizer.py#L194-L313

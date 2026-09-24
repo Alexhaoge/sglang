@@ -2761,6 +2761,11 @@ class Scheduler(
                 if req.extra_key is None
                 else f"{req.extra_key}|guard:{recv_req.rid}"
             )
+            # The first call wants a label for every token it sent, so no
+            # prefix may be reused: _compute_max_prefix_len turns this into a
+            # cap of 0. Leaving it None would let a cached prefix swallow part
+            # of the prompt and silently return fewer labels than tokens.
+            req.return_logprob_len = len(req.origin_input_ids)
             self.stream_queue[recv_req.rid] = req
             return req
         existing_req = self.stream_queue[recv_req.rid]
