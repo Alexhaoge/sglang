@@ -2755,6 +2755,43 @@ class Scheduler(
             # streams already in flight can still finish and release. Resumed
             # calls are never refused -- turning away a stream mid-conversation
             # would strand the KV it already holds.
+            # Two gates, because they catch different things.
+            #
+            # A count cap on live streams. KV usage is a lagging signal: when N
+            # streams open in the same instant the pool still reads empty, every
+            # one of them is admitted, and only afterwards does usage climb past
+            # any threshold -- by then the damage is done and resumed calls are
+            # never refused. A cap on len(stream_queue) is checked at
+            # registration, so it holds against a burst.
+            #
+            # Defaults to max_running_requests: the operator already declared
+            # there how much concurrency this server is for, and for a guard
+            # the live streams are what that number means. Deriving it from
+            # context_len instead would size every stream at the longest
+            # conversation allowed rather than the ones actually sent, which
+            # caps far below what the pool really holds. Size it deliberately
+            # with SGLANG_GUARD_MAX_STREAMS when the conversation length is
+            # known:  pool_tokens * 0.6 / ceil_to_page(input + output).
+            max_streams = os.environ.get("SGLANG_GUARD_MAX_STREAMS")
+            cap = int(max_streams) if max_streams else self.max_running_requests
+            if cap > 0 and len(self.stream_queue) >= cap:
+                msg = (
+                    f"guard stream {recv_req.rid} refused: {len(self.stream_queue)} "
+                    f"streams already live, cap is {cap}. A stream holds its KV "
+                    f"from its first call to its last, so the pool must fit every "
+                    f"live conversation at once. Raise the cap with "
+                    f"SGLANG_GUARD_MAX_STREAMS or give the pool more room with "
+                    f"--mem-fraction-static."
+                )
+                logger.warning(msg)
+                prepare_abort(
+                    req, msg, status_code=HTTPStatus.SERVICE_UNAVAILABLE
+                )
+                return req
+
+            # And a KV-usage gate, which catches what the count cap cannot:
+            # streams longer than the cap assumed, or a pool shared with
+            # something else. Lagging, but free to check.
             limit = float(
                 os.environ.get("SGLANG_GUARD_ADMIT_MAX_KV_USAGE", "0.90")
             )
@@ -2765,9 +2802,9 @@ class Scheduler(
                     f"guard stream {recv_req.rid} refused: KV usage "
                     f"{usage:.2f} > {limit:.2f}. Streams hold their KV between "
                     f"calls, so admitting more here would deadlock every "
-                    f"stream in flight. Retry shortly, cap concurrent streams, "
-                    f"or raise --mem-fraction-static. The threshold is "
-                    f"SGLANG_GUARD_ADMIT_MAX_KV_USAGE."
+                    f"stream in flight. Retry shortly, lower "
+                    f"SGLANG_GUARD_MAX_STREAMS, or raise --mem-fraction-static. "
+                    f"The threshold is SGLANG_GUARD_ADMIT_MAX_KV_USAGE."
                 )
                 logger.warning(msg)
                 prepare_abort(
