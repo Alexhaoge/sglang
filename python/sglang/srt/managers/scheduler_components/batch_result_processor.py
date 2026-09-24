@@ -468,15 +468,43 @@ class SchedulerBatchResultProcessor:
                         else:
                             # A resumable stream is paused, not done: park it
                             # exactly like a chunked prefill between chunks.
-                            # cache_unfinished_req hands the KV to the prefix
-                            # cache and frees the duplicate; the req-pool row
-                            # stays bound to this Req so the next call for this
-                            # rid reuses it (ReqToTokenPool.alloc reuses a row
-                            # whose Req still holds KV).  Freeing the row here
-                            # would strand the KV it maps to -- nothing else
-                            # ever frees it -- and the pool would grow until
-                            # the scheduler could not admit another request.
+                            # cache_unfinished_req hands the page-aligned
+                            # prefix to the tree and frees the duplicate; the
+                            # req-pool row stays bound to this Req so the next
+                            # call for this rid reuses it (ReqToTokenPool.alloc
+                            # reuses a row whose Req still holds KV).
                             maybe_cache_unfinished_req(req, self.tree_cache)
+
+                            # What the tree could not take is the trailing
+                            # partial page: upstream leaves it in the row and
+                            # expects the next chunk of the *same* prefill to
+                            # reuse it through req.prefix_indices.  A resumed
+                            # call does not do that -- it re-enters
+                            # init_next_round_input, which overwrites
+                            # prefix_indices from match_prefix -- so that tail
+                            # is orphaned, and nothing ever frees it.  At
+                            # page_size 128 that leaks up to a page per call:
+                            # ~168 tokens/call measured, which filled a
+                            # 159616-token pool after ~500 calls and deadlocked
+                            # the scheduler (every stream holds its KV between
+                            # calls, so there is nothing evictable left).
+                            # Release it here; the next call re-prefills those
+                            # tokens either way, so this costs no extra compute.
+                            protected = req.kv.cache_protected_len
+                            if req.kv.kv_allocated_len > protected:
+                                # protected is page-aligned (it is the length
+                                # of the tree-owned prefix), so this never
+                                # frees a page the tree still owns.
+                                self.tree_cache.free_kv_row(
+                                    req.kv, [(protected, req.kv.kv_allocated_len)]
+                                )
+                                req.kv.kv_allocated_len = protected
+                            if req.kv.kv_allocated_len == 0:
+                                # Sequence shorter than one page: the tree took
+                                # nothing and the row is now empty.  Give the
+                                # slot back so ReqKvInfo's invariant
+                                # (not holds_kv) == is_kv_released still holds.
+                                self.req_to_token_pool.free(req)
                     else:
                         maybe_cache_unfinished_req(req, self.tree_cache)
                 else:
