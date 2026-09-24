@@ -254,8 +254,10 @@ class SchedulerOutputStreamer:
         off the front; of those it keeps only the last ``return_logprob_len``,
         which on a resumed call is just the tokens added since the last call.
         """
-        if result is None:
-            return
+        # result is None on the admission/abort path: no forward pass ran, so
+        # there are no logits.  Those requests still need a reply, otherwise
+        # the caller waits for a response that never comes.
+        abort_only = result is None
 
         rids = []
         http_worker_ipcs = []
@@ -270,31 +272,35 @@ class SchedulerOutputStreamer:
         query_risk_level_logits = []
         query_category_logits = []
 
-        risk_flat = result.risk_level_logits.tolist()
-        category_flat = result.category_logits.tolist()
-        query_risk_flat = result.query_risk_level_logits.tolist()
-        query_category_flat = result.query_category_logits.tolist()
+        if abort_only:
+            risk_flat = category_flat = query_risk_flat = query_category_flat = []
+        else:
+            risk_flat = result.risk_level_logits.tolist()
+            category_flat = result.category_logits.tolist()
+            query_risk_flat = result.query_risk_level_logits.tolist()
+            query_category_flat = result.query_category_logits.tolist()
 
         for req in reqs:
-            req_origin_len = req.extend_range.length
-            return_logprob_len = (
-                req.return_logprob_len
-                if req.return_logprob_len is not None
-                else req_origin_len
-            )
-            # Guaranteed by the per-rid radix namespace set in
-            # Scheduler.resume(): a stream only matches its own prefix, which
-            # ends at or before the previous call's last token.  If this ever
-            # fires, some of the tokens this call sent were served from cache
-            # and have no logits -- returning the short slice would silently
-            # hand back fewer labels than tokens, so fail loudly instead.
-            assert return_logprob_len <= req_origin_len, (
-                f"guard stream {req.rid}: asked for logits of the last "
-                f"{return_logprob_len} tokens but only {req_origin_len} were "
-                f"computed this pass (prefix cache covered the rest); "
-                f"origin_len={len(req.origin_input_ids)}, "
-                f"extra_key={req.extra_key!r}"
-            )
+            if abort_only:
+                if not req.finished():
+                    continue
+                req_origin_len = return_logprob_len = 0
+            else:
+                req_origin_len = req.extend_range.length
+                return_logprob_len = (
+                    req.return_logprob_len
+                    if req.return_logprob_len is not None
+                    else req_origin_len
+                )
+            # Should be impossible: _compute_max_prefix_len caps the match at
+            # the tokens this call needs labels for.  If it happens anyway,
+            # process_batch_result_prefill has already aborted the request --
+            # emit no labels rather than a short slice, which would silently
+            # hand back fewer labels than tokens.  An earlier version asserted
+            # here, which killed the scheduler process and every other stream
+            # with it; one malformed request must not take down the service.
+            if return_logprob_len > req_origin_len:
+                return_logprob_len = 0
             start = req_origin_len - return_logprob_len
 
             if req.finished():

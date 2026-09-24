@@ -15,7 +15,7 @@ from typing import (
 
 import torch
 
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.utils import DisaggregationMode, prepare_abort
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import (
     LogitsProcessorOutput,
@@ -458,6 +458,33 @@ class SchedulerBatchResultProcessor:
                     req.time_stats.set_prefill_finished_time()
                     req.output_ids.append(0)
                     req.update_finish_state()
+
+                    # Invariant: every token this call wants a label for was
+                    # computed in this pass.  _compute_max_prefix_len enforces
+                    # it by capping the prefix match, so this should never
+                    # fire -- but if it does, the missing labels cannot be
+                    # produced.  End this one stream with an error instead of
+                    # returning a short slice (silently fewer labels than
+                    # tokens) or asserting (which killed the whole scheduler).
+                    if (
+                        req.return_logprob_len is not None
+                        and req.extend_range is not None
+                        and req.return_logprob_len > req.extend_range.length
+                    ):
+                        msg = (
+                            f"guard stream {req.rid}: asked for labels of the "
+                            f"last {req.return_logprob_len} tokens but only "
+                            f"{req.extend_range.length} were computed this "
+                            f"pass; origin_len={len(req.origin_input_ids)}, "
+                            f"extra_key={req.extra_key!r}"
+                        )
+                        logger.error(msg)
+                        prepare_abort(
+                            req, msg, HTTPStatus.INTERNAL_SERVER_ERROR
+                        )
+                        # Force the release path below: a stream that cannot
+                        # answer must not stay parked holding KV.
+                        req.resumable = False
 
                     if req.finished():
                         if not req.resumable:

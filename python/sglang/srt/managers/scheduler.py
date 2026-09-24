@@ -2742,6 +2742,39 @@ class Scheduler(
         tokens the caller wants logits for.
         """
         if recv_req.rid not in self.stream_queue:
+            # Admission control for NEW streams only.
+            #
+            # A streaming guard holds its KV between calls, and a paused
+            # stream is not in the running batch, so it cannot be retracted or
+            # preempted.  Once the pool is full every stream needs KV to move
+            # forward and none can be freed: the scheduler stops dead, with no
+            # crash, no traceback, and /health still answering.  Measured with
+            # 100 streams opening at the same instant.
+            #
+            # Refusing a new stream keeps the pool draining, because the
+            # streams already in flight can still finish and release. Resumed
+            # calls are never refused -- turning away a stream mid-conversation
+            # would strand the KV it already holds.
+            limit = float(
+                os.environ.get("SGLANG_GUARD_ADMIT_MAX_KV_USAGE", "0.90")
+            )
+            free = self.token_to_kv_pool_allocator.available_size()
+            usage = 1.0 - free / max(self.max_total_num_tokens, 1)
+            if usage > limit:
+                msg = (
+                    f"guard stream {recv_req.rid} refused: KV usage "
+                    f"{usage:.2f} > {limit:.2f}. Streams hold their KV between "
+                    f"calls, so admitting more here would deadlock every "
+                    f"stream in flight. Retry shortly, cap concurrent streams, "
+                    f"or raise --mem-fraction-static. The threshold is "
+                    f"SGLANG_GUARD_ADMIT_MAX_KV_USAGE."
+                )
+                logger.warning(msg)
+                prepare_abort(
+                    req, msg, status_code=HTTPStatus.SERVICE_UNAVAILABLE
+                )
+                return req
+
             # Keep every stream on its own branch of the radix tree.
             #
             # Two streams can carry byte-identical text.  If they shared a
@@ -2856,6 +2889,13 @@ class Scheduler(
 
             if self.is_stream_guard:
                 req = self.resume(recv_req, req)
+                if req.finished():
+                    # Admission refused: answer now, do not queue. result=None
+                    # tells the guard streamer there are no logits to slice.
+                    self.output_streamer.stream_output(
+                        [req], req.return_logprob, result=None
+                    )
+                    return
 
             req.tokenizer = self.tokenizer
 
