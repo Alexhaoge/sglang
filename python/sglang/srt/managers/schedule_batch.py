@@ -1134,6 +1134,11 @@ class Req(ReqDllmMixin):
         # Receipt of the tree lock held on last_node (anchor, SWA boundary,
         # skipped components); every release replays it unchanged.
         self.lock_receipt: DecLockRefParams = DecLockRefParams()
+        # Qwen3Guard-Stream: the tree lock a paused stream still holds when its
+        # next call arrives, as (last_node, lock_receipt). Re-admission
+        # overwrites both fields, so the lock must be remembered here and
+        # released once the new one is taken (see PrefillAdder._req_inc_lock_ref).
+        self.guard_parked_lock = None
         # Device/host prefix used to plan the latest L3 lookup. Admission uses
         # it to detect newly exposed storage demand after queue-time eviction.
         self.storage_prefetch_last_match_len: Optional[int] = None

@@ -2850,6 +2850,19 @@ class Scheduler(
             self.stream_queue[recv_req.rid] = req
             return req
         existing_req = self.stream_queue[recv_req.rid]
+        # A paused stream holds one tree lock, taken by cache_unfinished_req
+        # when its previous call ended. This call is about to go through
+        # admission again: init_next_round_input overwrites last_node and
+        # _req_inc_lock_ref overwrites lock_receipt, after which the paused
+        # lock can never be released. Every resume leaked one lock, every
+        # stream's whole path stayed locked after it ended, and the pool
+        # filled run after run: token usage 0.98 with nothing running, then
+        # every new stream refused. Remember it so admission can hand it over.
+        if existing_req.kv.holds_kv and existing_req.last_node is not None:
+            existing_req.guard_parked_lock = (
+                existing_req.last_node,
+                existing_req.lock_receipt,
+            )
         input_ids = recv_req.input_ids
         if (
             self.tokenizer is not None
