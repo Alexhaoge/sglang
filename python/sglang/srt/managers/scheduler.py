@@ -2792,10 +2792,21 @@ class Scheduler(
             # And a KV-usage gate, which catches what the count cap cannot:
             # streams longer than the cap assumed, or a pool shared with
             # something else. Lagging, but free to check.
+            #
+            # Usage here must mean KV that is actually held, the same quantity
+            # the scheduler logs as "token usage". Finished streams leave their
+            # prefixes in the radix tree as evictable cache, and the allocator
+            # reclaims that cache on demand, so it is free capacity, not load.
+            # Counting it as used makes a healthy cache look like a full pool:
+            # after one full run the tree holds ~98% of the pool, the log
+            # reads 0.65, and this gate refused every new stream.
             limit = float(
                 os.environ.get("SGLANG_GUARD_ADMIT_MAX_KV_USAGE", "0.90")
             )
-            free = self.token_to_kv_pool_allocator.available_size()
+            free = (
+                self.token_to_kv_pool_allocator.available_size()
+                + self.tree_cache.evictable_size()
+            )
             usage = 1.0 - free / max(self.max_total_num_tokens, 1)
             if usage > limit:
                 msg = (
