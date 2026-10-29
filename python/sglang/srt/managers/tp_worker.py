@@ -267,6 +267,20 @@ class BaseTpWorker(ABC):
         )
         return result
 
+    def forward_stream_guard(self, batch: ScheduleBatch):
+        """One Qwen3Guard-Stream classification pass over a prefill batch.
+
+        The model returns head logits instead of next-token logits, so there is
+        nothing to sample and no CUDA graph to replay.
+        """
+        forward_batch = ForwardBatch.init_new(
+            batch,
+            self.model_runner,
+            return_hidden_states_before_norm=False,
+        )
+        output = self.model_runner.forward(forward_batch)
+        return output.logits_output
+
     def forward_batch_embedding(self, batch: ScheduleBatch):
         forward_batch = ForwardBatch.init_new(
             batch,

@@ -415,6 +415,19 @@ class ModelRunner:
         # initialize(), long before the weights are loaded.
         self.draft_load_format = self._resolve_draft_load_format()
         self.is_generation = model_config.is_generation
+        # A classification-only generation model (Qwen3Guard-Stream) returns
+        # head logits, not embeddings: never ask the forward for the pooled
+        # path even if the runner was started with --is-embedding.
+        self.is_stream_guard = (
+            "Qwen3ForGuardModel" in model_config.hf_config.architectures
+        )
+        if self.is_stream_guard and get_parallel().pp_size > 1:
+            # A guard pass has no token to hand to the next pipeline stage: the
+            # heads run on the last rank and the logits are the answer. Refusing
+            # here beats returning an empty reply on every call.
+            raise ValueError(
+                "pipeline parallelism is not supported for Qwen3ForGuardModel"
+            )
         self.device_timer = None
         self.is_multimodal = model_config.is_multimodal
         self.is_multimodal_chunked_prefill_supported = (
@@ -1814,7 +1827,7 @@ class ModelRunner:
             kwargs["input_embeds"][forward_batch.replace_positions] = (
                 forward_batch.replace_embeds.to(kwargs["input_embeds"].dtype)
             )
-        if not self.is_generation:
+        if not self.is_generation and not self.is_stream_guard:
             kwargs["get_embedding"] = True
         return kwargs
 
