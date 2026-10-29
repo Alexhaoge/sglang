@@ -24,6 +24,7 @@ from sglang.srt.layers.logits_processor import (
 from sglang.srt.managers.auxiliary_output import CommittedTokens
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
+    FINISH_LENGTH,
     FINISH_MATCHED_TOKEN,
     Req,
     ScheduleBatch,
@@ -75,6 +76,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.utils import (
         EmbeddingBatchResult,
         GenerationBatchResult,
+        StreamGuardResult,
     )
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
@@ -97,6 +99,8 @@ def _get_speculative_output_stride(result: GenerationBatchResult) -> int:
 @dataclass(kw_only=True, slots=True, frozen=True)
 class SchedulerBatchResultProcessor:
     is_generation: bool
+    # Qwen3Guard-Stream: classification-only architecture, no decode loop.
+    is_stream_guard: bool = False
     disaggregation_mode: DisaggregationMode
     enable_overlap: bool
     enable_overlap_mlx: bool
@@ -259,12 +263,62 @@ class SchedulerBatchResultProcessor:
     def process_batch_result_prefill(
         self,
         batch: ScheduleBatch,
-        result: Union[GenerationBatchResult, EmbeddingBatchResult],
+        result: Union[GenerationBatchResult, EmbeddingBatchResult, StreamGuardResult],
     ):
         skip_stream_req = None
         self.token_to_kv_pool_allocator.free_group_begin()
 
-        if self.is_generation:
+        if self.is_stream_guard:
+            # Qwen3Guard-Stream: the head logits are the output. No token is
+            # generated, so the request finishes holding no output token -- a
+            # dummy one would be inherited by the session's next turn, whose
+            # context is this turn's prompt plus its output tokens.
+            for req in batch.reqs:
+                if req.is_retracted:
+                    continue
+
+                if (
+                    req.discard_output_reason is not None
+                    and req.inflight_middle_chunks <= 0
+                ):
+                    req.to_finish = req.discard_output_reason
+                    req.update_finish_state(0)
+                    release_kv_cache(req, self.tree_cache, checkpoint=False)
+                    req.time_stats.set_completion_time()
+                    continue
+
+                if req.inflight_middle_chunks <= 0:
+                    req.time_stats.set_prefill_finished_time()
+                    # Invariant: every token this call wants a label for was
+                    # computed in this pass. _compute_max_prefix_len enforces it
+                    # by capping the prefix match, so this should never fire --
+                    # but if it does, the missing labels cannot be produced.
+                    # End this one stream with an error instead of returning a
+                    # short slice (silently fewer labels than tokens) or
+                    # asserting (which would kill the scheduler and every other
+                    # stream with it).
+                    if (
+                        req.return_logprob_len is not None
+                        and req.return_logprob_len > req.extend_len
+                    ):
+                        req.to_finish = FINISH_ABORT(
+                            "guard pass covered fewer tokens than the labels "
+                            f"requested ({req.return_logprob_len} > "
+                            f"{req.extend_len})",
+                            HTTPStatus.INTERNAL_SERVER_ERROR,
+                            "InternalServerError",
+                        )
+                    else:
+                        req.to_finish = FINISH_LENGTH(length=0)
+                    req.update_finish_state(0)
+                    release_kv_cache(req, self.tree_cache, checkpoint=True)
+                    req.time_stats.set_completion_time()
+                else:
+                    # being chunked reqs' prefill is not finished
+                    req.inflight_middle_chunks -= 1
+                    req.time_stats.set_last_chunked_prefill_finish_time()
+
+        elif self.is_generation:
             if result.copy_done is not None:
                 result.copy_done.synchronize()
             auxiliary_output_starts = self.snapshot_auxiliary_output_starts(
@@ -501,7 +555,12 @@ class SchedulerBatchResultProcessor:
 
         self.token_to_kv_pool_allocator.free_group_end()
         self.output_streamer.stream_output(
-            batch.reqs, batch.return_logprob, skip_stream_req
+            batch.reqs,
+            batch.return_logprob,
+            skip_stream_req,
+            # The guard result is the answer, not a logprobs structure the
+            # streamer can read off each req.
+            result=result if self.is_stream_guard else None,
         )
 
         can_run_cuda_graph = result.can_run_cuda_graph

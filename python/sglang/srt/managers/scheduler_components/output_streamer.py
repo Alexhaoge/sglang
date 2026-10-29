@@ -23,6 +23,7 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
     BatchEmbeddingOutput,
+    BatchStreamGuardOutput,
     BatchTokenIDOutput,
     CachedTokensDetails,
     wrap_as_pickle,
@@ -39,6 +40,7 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.weight_versions import compute_weight_version_spans
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.utils import StreamGuardResult
     from sglang.srt.observability.req_time_stats import SchedulerReqTimeStats
     from sglang.srt.rust_server.server import RustServer
 
@@ -47,6 +49,49 @@ logger = logging.getLogger(__name__)
 
 
 DEFAULT_FORCE_STREAM_INTERVAL = envs.SGLANG_FORCE_STREAM_INTERVAL.get()
+
+
+def _guard_row_budget(reqs: List[Req]) -> tuple[list[int], list[int]]:
+    """How many rows of the guard output each request owns and reports.
+
+    A guard forward emits one row per prefill token, so a request owns
+    ``extend_len`` of them; it reports the last ``return_logprob_len`` -- on a
+    resumed session turn, only the tokens appended since the previous turn.
+    """
+    extend_lens = []
+    keeps = []
+    for req in reqs:
+        extend_len = req.extend_len or 0
+        requested = req.return_logprob_len
+        if requested is None:
+            keep = extend_len
+        elif requested > extend_len:
+            # Should be impossible: _compute_max_prefix_len caps the prefix
+            # match at the tokens this call needs labels for, so the extend
+            # covers them. If it happens anyway, report no labels rather than a
+            # short slice, which would silently hand back fewer labels than
+            # tokens.
+            keep = 0
+        else:
+            keep = requested
+        extend_lens.append(extend_len)
+        keeps.append(keep)
+    return extend_lens, keeps
+
+
+def _split_guard_rows(
+    flat: List[List[float]], extend_lens: List[int], keeps: List[int]
+) -> List[List[List[float]]]:
+    """Cut batch-flat head logits into per-request rows.
+
+    Request ``i`` takes the next ``extend_lens[i]`` rows and keeps the last
+    ``keeps[i]`` of them.
+    """
+    per_req = []
+    for extend_len, keep in zip(extend_lens, keeps):
+        rows, flat = flat[:extend_len], flat[extend_len:]
+        per_req.append(rows[extend_len - keep :] if keep else [])
+    return per_req
 
 
 def _scheduler_decode_latency(time_stats: SchedulerReqTimeStats) -> Optional[float]:
@@ -74,6 +119,8 @@ class SchedulerOutputStreamer:
     spec_algorithm: SpeculativeAlgorithm
     disaggregation_mode: DisaggregationMode
     enable_hicache_storage: Callable[[], bool]
+    # Qwen3Guard-Stream emits classification logits instead of tokens.
+    is_stream_guard: bool = False
     # When SGLANG_RUST_SERVER is on, generation output is pushed to the embedded
     # Rust egress ring via `rust_server.push_generation` instead of the zmq
     # detokenizer. None otherwise. (Rust-specific state lives in RustServer.)
@@ -141,12 +188,15 @@ class SchedulerOutputStreamer:
         reqs: List[Req],
         return_logprob: bool,
         skip_req: Optional[Req] = None,
+        result: Optional["StreamGuardResult"] = None,
     ):
         """Stream the output to detokenizer."""
         if self.defer_outputs:
             # The scheduler releases held requests after their work completes.
             reqs = [req for req in reqs if not req.defer_output]
-        if self.is_generation:
+        if self.is_stream_guard:
+            self._stream_output_guard(reqs, result)
+        elif self.is_generation:
             self._stream_output_generation(reqs, return_logprob, skip_req)
         else:  # embedding or reward model
             self._stream_output_embedding(reqs)
@@ -335,6 +385,86 @@ class SchedulerOutputStreamer:
                 placeholder_tokens_val=None,
                 retraction_counts=retraction_counts,
                 pooled_hidden_states=stacked_phs,
+            )
+        )
+
+    def _stream_output_guard(
+        self, reqs: List[Req], result: Optional["StreamGuardResult"]
+    ):
+        """Send Qwen3Guard-Stream classification logits for this batch.
+
+        The model emits one row per prefill token, flat over the whole batch and
+        in batch order. Each request consumes its own ``extend_len`` rows off
+        the front; of those it keeps the last ``return_logprob_len`` -- on a
+        resumed turn, just the tokens appended since the previous one.
+        """
+        # result is None on the admission/abort path: no forward pass ran, so
+        # there are no logits. Those requests still need a reply, otherwise the
+        # caller waits for a response that never comes.
+        if result is None:
+            # No forward ran, so every request reports no labels.
+            risk_slices = [[] for _ in reqs]
+            category_slices = [[] for _ in reqs]
+            query_risk_slices = [[] for _ in reqs]
+            query_category_slices = [[] for _ in reqs]
+        else:
+            extend_lens, keeps = _guard_row_budget(reqs)
+            risk_slices = _split_guard_rows(
+                result.risk_level_logits.tolist(), extend_lens, keeps
+            )
+            category_slices = _split_guard_rows(
+                result.category_logits.tolist(), extend_lens, keeps
+            )
+            query_risk_slices = _split_guard_rows(
+                result.query_risk_level_logits.tolist(), extend_lens, keeps
+            )
+            query_category_slices = _split_guard_rows(
+                result.query_category_logits.tolist(), extend_lens, keeps
+            )
+
+        rids = []
+        http_worker_ipcs = []
+        finished_reasons: List[BaseFinishReason] = []
+        prompt_tokens = []
+        cached_tokens = []
+        retraction_counts = []
+        time_stats = []
+
+        risk_level_logits = []
+        category_logits = []
+        query_risk_level_logits = []
+        query_category_logits = []
+
+        for i, req in enumerate(reqs):
+            if not req.finished():
+                # Still chunked-prefilling: no labels to report yet.
+                continue
+            rids.append(req.rid)
+            http_worker_ipcs.append(req.http_worker_ipc)
+            finished_reasons.append(req.finished_reason.to_json())
+            prompt_tokens.append(len(req.origin_input_ids))
+            cached_tokens.append(req.cached_tokens)
+            retraction_counts.append(req.retraction_count)
+            time_stats.append(req.time_stats)
+
+            risk_level_logits.append(risk_slices[i])
+            category_logits.append(category_slices[i])
+            query_risk_level_logits.append(query_risk_slices[i])
+            query_category_logits.append(query_category_slices[i])
+
+        self.send_to_detokenizer.send_output(
+            BatchStreamGuardOutput(
+                rids=rids,
+                http_worker_ipcs=http_worker_ipcs,
+                finished_reasons=finished_reasons,
+                risk_level_logits=risk_level_logits,
+                category_logits=category_logits,
+                query_risk_level_logits=query_risk_level_logits,
+                query_category_logits=query_category_logits,
+                prompt_tokens=prompt_tokens,
+                cached_tokens=cached_tokens,
+                retraction_counts=retraction_counts,
+                time_stats=time_stats or None,
             )
         )
 
