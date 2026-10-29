@@ -299,6 +299,15 @@ class BaseTpWorker(ABC):
         )
         return result
 
+    def forward_stream_guard(self, batch: ScheduleBatch):
+        forward_batch = ForwardBatch.init_new(
+            batch,
+            self.model_runner,
+            return_hidden_states_before_norm=False,
+        )
+        output = self.model_runner.forward(forward_batch)
+        return output.logits_output
+
     def forward_batch_embedding(self, batch: ScheduleBatch):
         forward_batch = ForwardBatch.init_new(
             batch,

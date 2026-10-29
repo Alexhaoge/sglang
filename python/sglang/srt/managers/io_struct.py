@@ -351,6 +351,10 @@ class GenerateReqInput:
     # Cache namespace used to isolate otherwise-identical prefixes.
     cache_salt: Optional[Union[List[str], str]] = None
 
+    # Qwen3Guard-Stream: keep this rid's state alive so the next call with the
+    # same rid continues the sequence instead of starting a new one.
+    resumable: bool = False
+
     def regenerate_rid(self):
         """Generate a new request ID and return it."""
         if isinstance(self.rid, list):
@@ -891,6 +895,7 @@ class GenerateReqInput:
             return cache[i]
         sub = GenerateReqInput(
             rid=self.rid[i],
+            resumable=self.resumable,
             session_id=self.session_id,
             text=self.text[i] if self.text is not None else None,
             input_ids=self.input_ids[i] if self.input_ids is not None else None,
@@ -1077,6 +1082,9 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
 
     # Cache namespace used to isolate otherwise-identical prefixes.
     cache_salt: Optional[str] = None
+
+    # Qwen3Guard-Stream: see GenerateReqInput.resumable.
+    resumable: bool = False
 
     def wrap_pickle_fields(self):
         self.time_stats = wrap_as_pickle(self.time_stats)
@@ -1658,6 +1666,35 @@ class BatchEmbeddingOutput(BaseBatchReq, kw_only=True):
     #   Stacked:     [stacked_tensor(N, ...)] — len 1, reduces pickle overhead
     #   Non-stacked: [t0, t1, ..., tN]       — len N, when shapes differ or None entries exist
     pooled_hidden_states: Optional[List[Optional[torch.Tensor]]] = None
+
+
+class BatchStreamGuardOutput(BaseBatchReq, kw_only=True):
+    """Qwen3Guard-Stream classification logits for one scheduler step.
+
+    ``rids`` and ``http_worker_ipcs`` come from ``BaseBatchReq``.  Each logits
+    list is per-request; its inner list covers the tokens whose logits the
+    caller asked for — all prefill tokens on the first call, only the newly
+    appended tokens on a resumed call.
+    """
+
+    # The finish reason
+    finished_reasons: List[Optional[FinishReasonDict]]
+
+    risk_level_logits: List[List[float]]
+    category_logits: List[List[float]]
+    query_risk_level_logits: List[List[float]]
+    query_category_logits: List[List[float]]
+
+    # Token counts
+    prompt_tokens: List[int]
+    cached_tokens: List[int]
+
+    # Number of times each request was retracted.
+    retraction_counts: Optional[List[int]] = None
+
+    # For observability
+    # Pickled Optional[List[SchedulerReqTimeStats]]
+    time_stats: Optional[PickleWrapper] = None
 
 
 class ClearHiCacheReqInput(BaseReq, kw_only=True):

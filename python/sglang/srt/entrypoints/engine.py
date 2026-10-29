@@ -430,6 +430,8 @@ class Engine(EngineScoreMixin, EngineBase):
         session_params: Optional[Dict] = None,
         priority: Optional[int] = None,
         session_id: Optional[str] = None,
+        # Qwen3Guard-Stream: keep this rid alive for a follow-up call.
+        resumable: Optional[bool] = False,
         *,
         cache_salt: Optional[Union[List[str], str]] = None,
     ) -> Union[Dict, Iterator[Dict]]:
@@ -472,6 +474,7 @@ class Engine(EngineScoreMixin, EngineBase):
             session_id=session_id,
             session_params=session_params,
             priority=priority,
+            resumable=resumable,
         )
         generator = self.tokenizer_manager.generate_request(obj, None)
 
@@ -543,6 +546,8 @@ class Engine(EngineScoreMixin, EngineBase):
         session_params: Optional[Dict] = None,
         priority: Optional[int] = None,
         session_id: Optional[str] = None,
+        # Qwen3Guard-Stream: keep this rid alive for a follow-up call.
+        resumable: Optional[bool] = False,
         *,
         cache_salt: Optional[Union[List[str], str]] = None,
     ) -> Union[Dict, AsyncIterator[Dict]]:
@@ -585,6 +590,7 @@ class Engine(EngineScoreMixin, EngineBase):
             session_id=session_id,
             session_params=session_params,
             priority=priority,
+            resumable=resumable,
         )
         generator = self.tokenizer_manager.generate_request(obj, None)
 

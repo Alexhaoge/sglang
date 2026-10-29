@@ -332,6 +332,26 @@ def get_logprob_from_pp_outputs(
 
 
 @dataclass
+class StreamGuardResult:
+    """Result of one Qwen3Guard-Stream forward pass.
+
+    The model emits four classification heads instead of next-token logits:
+    two for the user query and two for the assistant response, each split into
+    a risk level (Safe / Unsafe / Controversial) and a content category.
+    Tensors are flat over all tokens of the batch; ``stream_output`` slices
+    them back per request using each request's extend length.
+    """
+
+    risk_level_logits: Optional[torch.Tensor]
+    category_logits: Optional[torch.Tensor]
+    query_risk_level_logits: Optional[torch.Tensor]
+    query_category_logits: Optional[torch.Tensor]
+    hidden_states: Optional[torch.Tensor]
+    bid: int = -1
+    can_run_cuda_graph: bool = False
+
+
+@dataclass
 class EmbeddingBatchResult:
     """Result from an embedding/classification forward pass.
 

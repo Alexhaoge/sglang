@@ -23,6 +23,7 @@ from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
     BatchEmbeddingOutput,
+    BatchStreamGuardOutput,
     BatchTokenIDOutput,
     CachedTokensDetails,
     wrap_as_pickle,
@@ -38,6 +39,7 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.weight_versions import compute_weight_version_spans
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.utils import StreamGuardResult
     from sglang.srt.rust_server.server import RustServer
 
 
@@ -59,6 +61,8 @@ class SchedulerOutputStreamer:
     spec_algorithm: SpeculativeAlgorithm
     disaggregation_mode: DisaggregationMode
     enable_hicache_storage: Callable[[], bool]
+    # Qwen3Guard-Stream emits classification logits instead of tokens.
+    is_stream_guard: bool = False
     # When SGLANG_RUST_SERVER is on, generation output is pushed to the embedded
     # Rust egress ring via `rust_server.push_generation` instead of the zmq
     # detokenizer. None otherwise. (Rust-specific state lives in RustServer.)
@@ -120,9 +124,12 @@ class SchedulerOutputStreamer:
         reqs: List[Req],
         return_logprob: bool,
         skip_req: Optional[Req] = None,
+        result: Optional["StreamGuardResult"] = None,
     ):
         """Stream the output to detokenizer."""
-        if self.is_generation:
+        if self.is_stream_guard:
+            self._stream_output_guard(reqs, result)
+        elif self.is_generation:
             self._stream_output_generation(reqs, return_logprob, skip_req)
         else:  # embedding or reward model
             self._stream_output_embedding(reqs)
@@ -236,6 +243,100 @@ class SchedulerOutputStreamer:
             and get_observability().enable_request_time_stats_logging
         ):
             req.log_time_stats()
+
+    def _stream_output_guard(
+        self, reqs: List[Req], result: Optional["StreamGuardResult"]
+    ):
+        """Send Qwen3Guard-Stream classification logits for this batch.
+
+        The model emits one set of logits per prefill token, flat over the
+        whole batch.  Each request takes its own ``extend_range.length`` tokens
+        off the front; of those it keeps only the last ``return_logprob_len``,
+        which on a resumed call is just the tokens added since the last call.
+        """
+        # result is None on the admission/abort path: no forward pass ran, so
+        # there are no logits.  Those requests still need a reply, otherwise
+        # the caller waits for a response that never comes.
+        abort_only = result is None
+
+        rids = []
+        http_worker_ipcs = []
+        finished_reasons: List[BaseFinishReason] = []
+        prompt_tokens = []
+        cached_tokens = []
+        retraction_counts = []
+        time_stats = []
+
+        risk_level_logits = []
+        category_logits = []
+        query_risk_level_logits = []
+        query_category_logits = []
+
+        if abort_only:
+            risk_flat = category_flat = query_risk_flat = query_category_flat = []
+        else:
+            risk_flat = result.risk_level_logits.tolist()
+            category_flat = result.category_logits.tolist()
+            query_risk_flat = result.query_risk_level_logits.tolist()
+            query_category_flat = result.query_category_logits.tolist()
+
+        for req in reqs:
+            if abort_only:
+                if not req.finished():
+                    continue
+                req_origin_len = return_logprob_len = 0
+            else:
+                req_origin_len = req.extend_range.length
+                return_logprob_len = (
+                    req.return_logprob_len
+                    if req.return_logprob_len is not None
+                    else req_origin_len
+                )
+            # Should be impossible: _compute_max_prefix_len caps the match at
+            # the tokens this call needs labels for.  If it happens anyway,
+            # process_batch_result_prefill has already aborted the request --
+            # emit no labels rather than a short slice, which would silently
+            # hand back fewer labels than tokens.  An earlier version asserted
+            # here, which killed the scheduler process and every other stream
+            # with it; one malformed request must not take down the service.
+            if return_logprob_len > req_origin_len:
+                return_logprob_len = 0
+            start = req_origin_len - return_logprob_len
+
+            if req.finished():
+                rids.append(req.rid)
+                http_worker_ipcs.append(req.http_worker_ipc)
+                finished_reasons.append(req.finished_reason.to_json())
+                prompt_tokens.append(len(req.origin_input_ids))
+                cached_tokens.append(req.cached_tokens)
+                retraction_counts.append(req.retraction_count)
+                time_stats.append(req.time_stats)
+
+            risk_level_logits.append(risk_flat[start:req_origin_len])
+            category_logits.append(category_flat[start:req_origin_len])
+            query_risk_level_logits.append(query_risk_flat[start:req_origin_len])
+            query_category_logits.append(query_category_flat[start:req_origin_len])
+
+            risk_flat = risk_flat[req_origin_len:]
+            category_flat = category_flat[req_origin_len:]
+            query_risk_flat = query_risk_flat[req_origin_len:]
+            query_category_flat = query_category_flat[req_origin_len:]
+
+        self.send_to_detokenizer.send_output(
+            BatchStreamGuardOutput(
+                rids=rids,
+                http_worker_ipcs=http_worker_ipcs,
+                finished_reasons=finished_reasons,
+                risk_level_logits=risk_level_logits,
+                category_logits=category_logits,
+                query_risk_level_logits=query_risk_level_logits,
+                query_category_logits=query_category_logits,
+                prompt_tokens=prompt_tokens,
+                cached_tokens=cached_tokens,
+                retraction_counts=retraction_counts,
+                time_stats=wrap_as_pickle(time_stats),
+            )
+        )
 
     def _stream_output_embedding(self, reqs: List[Req]):
         rids = []

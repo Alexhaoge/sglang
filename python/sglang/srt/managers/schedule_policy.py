@@ -1092,6 +1092,14 @@ class PrefillAdder:
     def _req_inc_lock_ref(self, req: Req):
         # Persist the release receipt.
         req.lock_receipt = self.tree_cache.inc_lock_ref(req.last_node).to_dec_params()
+        # A resumed Qwen3Guard-Stream call still holds the lock its stream
+        # took when it paused. Release it only now, after the new lock is in
+        # place, so the stream's prefix is never unlocked -- and so never
+        # evictable -- between the two calls.
+        parked = getattr(req, "guard_parked_lock", None)
+        if parked is not None:
+            req.guard_parked_lock = None
+            self.tree_cache.dec_lock_ref(parked[0], parked[1])
 
     def add_dllm_staging_req(self, req: Req):
         assert self.dllm_config is not None

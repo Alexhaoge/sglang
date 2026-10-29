@@ -978,6 +978,7 @@ class Req(ReqDllmMixin):
         multi_item_delimiter_indices: Optional[List[int]] = None,
         session_id: Optional[str] = None,
         cache_salt: Optional[str] = None,
+        resumable: Optional[bool] = False,
     ):
         # Input and output info
         self.rid = rid
@@ -1133,6 +1134,11 @@ class Req(ReqDllmMixin):
         # Receipt of the tree lock held on last_node (anchor, SWA boundary,
         # skipped components); every release replays it unchanged.
         self.lock_receipt: DecLockRefParams = DecLockRefParams()
+        # Qwen3Guard-Stream: the tree lock a paused stream still holds when its
+        # next call arrives, as (last_node, lock_receipt). Re-admission
+        # overwrites both fields, so the lock must be remembered here and
+        # released once the new one is taken (see PrefillAdder._req_inc_lock_ref).
+        self.guard_parked_lock = None
         # Device/host prefix used to plan the latest L3 lookup. Admission uses
         # it to detect newly exposed storage demand after queue-time eviction.
         self.storage_prefetch_last_match_len: Optional[int] = None
@@ -1313,6 +1319,10 @@ class Req(ReqDllmMixin):
         # first prefill batch; the cached-prefix early-send never goes past it.
         self.early_send_prefix_end: Optional[int] = None
         self.metadata_buffer_index: int = -1
+        # Qwen3Guard-Stream: this request will be resumed with more tokens.
+        self.resumable: bool = resumable
+        # Number of trailing tokens whose logits the caller wants back.
+        self.return_logprob_len = None
         # Used in overlap sequence to signal that an optimistic request should
         # abort chunking. Set in create_sender, consumed in process_batch_result.
         self.pending_bootstrap = False
@@ -1633,6 +1643,13 @@ class Req(ReqDllmMixin):
         max_prefix_len = input_len - 1
         if self.return_logprob and self.logprob_start_len >= 0:
             max_prefix_len = min(max_prefix_len, self.logprob_start_len)
+        # Qwen3Guard-Stream, for the same reason as logprob_start_len above: a
+        # classification head only runs on tokens computed in this forward
+        # pass. KV for a cached prefix is reusable, head outputs are not. So
+        # the match must stop before the tokens this call wants labels for --
+        # otherwise they are never recomputed and their labels do not exist.
+        if self.return_logprob_len is not None:
+            max_prefix_len = min(max_prefix_len, input_len - self.return_logprob_len)
         return max(max_prefix_len, 0)
 
     # Based on https://github.com/vllm-project/vllm/blob/7a64d24aad69e4d2548aa0bf528d9fe63428ab01/vllm/transformers_utils/detokenizer.py#L194-L313

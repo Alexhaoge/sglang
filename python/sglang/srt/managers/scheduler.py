@@ -278,6 +278,7 @@ from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 from sglang.srt.managers.utils import (
     EmbeddingBatchResult,
     GenerationBatchResult,
+    StreamGuardResult,
     is_health_check_generate_req,
     validate_input_length,
 )
@@ -690,6 +691,14 @@ class Scheduler(
         self.init_dsa_kpool_truncation_align()
 
         self.init_weight_updater()
+
+        # Qwen3Guard-Stream: one classification pass per call, no decode loop.
+        # Requests marked resumable stay in stream_queue between calls so a
+        # later call with the same rid extends the same sequence.
+        self.is_stream_guard = (
+            self.model_config.hf_config.architectures[0] == "Qwen3ForGuardModel"
+        )
+        self.stream_queue: Dict[str, Req] = {}
 
         # Init request dispatcher
         self.init_request_dispatcher()
@@ -2461,6 +2470,7 @@ class Scheduler(
             ps=self.ps,
             server_args=self.server_args,
             is_generation=self.is_generation,
+            is_stream_guard=self.is_stream_guard,
             spec_algorithm=self.spec_algorithm,
             disaggregation_mode=self.disaggregation_mode,
             enable_hicache_storage=lambda: self.enable_hicache_storage,
@@ -2486,6 +2496,8 @@ class Scheduler(
         self.init_beam_coordinator()
         self.batch_result_processor = SchedulerBatchResultProcessor(
             is_generation=self.is_generation,
+            is_stream_guard=self.is_stream_guard,
+            stream_queue=self.stream_queue,
             disaggregation_mode=self.disaggregation_mode,
             enable_overlap=self.enable_overlap,
             enable_overlap_mlx=self.enable_overlap_mlx,
@@ -2721,6 +2733,150 @@ class Scheduler(
             mm_inputs.release_features()
             req.multimodal_inputs = None
 
+    def resume(self, recv_req: TokenizedGenerateReqInput, req: Req) -> Req:
+        """Attach a Qwen3Guard-Stream call to the sequence its rid names.
+
+        The first call for an rid registers the request.  Later calls carry
+        only the newly produced tokens, which are appended to the sequence
+        already in flight; ``return_logprob_len`` records how many trailing
+        tokens the caller wants logits for.
+        """
+        if recv_req.rid not in self.stream_queue:
+            # Admission control for NEW streams only.
+            #
+            # A streaming guard holds its KV between calls, and a paused
+            # stream is not in the running batch, so it cannot be retracted or
+            # preempted.  Once the pool is full every stream needs KV to move
+            # forward and none can be freed: the scheduler stops dead, with no
+            # crash, no traceback, and /health still answering.  Measured with
+            # 100 streams opening at the same instant.
+            #
+            # Refusing a new stream keeps the pool draining, because the
+            # streams already in flight can still finish and release. Resumed
+            # calls are never refused -- turning away a stream mid-conversation
+            # would strand the KV it already holds.
+            # Two gates, because they catch different things.
+            #
+            # A count cap on live streams. KV usage is a lagging signal: when N
+            # streams open in the same instant the pool still reads empty, every
+            # one of them is admitted, and only afterwards does usage climb past
+            # any threshold -- by then the damage is done and resumed calls are
+            # never refused. A cap on len(stream_queue) is checked at
+            # registration, so it holds against a burst.
+            #
+            # Defaults to max_running_requests: the operator already declared
+            # there how much concurrency this server is for, and for a guard
+            # the live streams are what that number means. Deriving it from
+            # context_len instead would size every stream at the longest
+            # conversation allowed rather than the ones actually sent, which
+            # caps far below what the pool really holds. Size it deliberately
+            # with SGLANG_GUARD_MAX_STREAMS when the conversation length is
+            # known:  pool_tokens * 0.6 / ceil_to_page(input + output).
+            max_streams = os.environ.get("SGLANG_GUARD_MAX_STREAMS")
+            cap = int(max_streams) if max_streams else self.max_running_requests
+            if cap > 0 and len(self.stream_queue) >= cap:
+                msg = (
+                    f"guard stream {recv_req.rid} refused: {len(self.stream_queue)} "
+                    f"streams already live, cap is {cap}. A stream holds its KV "
+                    f"from its first call to its last, so the pool must fit every "
+                    f"live conversation at once. Raise the cap with "
+                    f"SGLANG_GUARD_MAX_STREAMS or give the pool more room with "
+                    f"--mem-fraction-static."
+                )
+                logger.warning(msg)
+                prepare_abort(
+                    req, msg, status_code=HTTPStatus.SERVICE_UNAVAILABLE
+                )
+                return req
+
+            # And a KV-usage gate, which catches what the count cap cannot:
+            # streams longer than the cap assumed, or a pool shared with
+            # something else. Lagging, but free to check.
+            #
+            # Usage here must mean KV that is actually held, the same quantity
+            # the scheduler logs as "token usage". Finished streams leave their
+            # prefixes in the radix tree as evictable cache, and the allocator
+            # reclaims that cache on demand, so it is free capacity, not load.
+            # Counting it as used makes a healthy cache look like a full pool:
+            # after one full run the tree holds ~98% of the pool, the log
+            # reads 0.65, and this gate refused every new stream.
+            limit = float(
+                os.environ.get("SGLANG_GUARD_ADMIT_MAX_KV_USAGE", "0.90")
+            )
+            free = (
+                self.token_to_kv_pool_allocator.available_size()
+                + self.tree_cache.evictable_size()
+            )
+            usage = 1.0 - free / max(self.max_total_num_tokens, 1)
+            if usage > limit:
+                msg = (
+                    f"guard stream {recv_req.rid} refused: KV usage "
+                    f"{usage:.2f} > {limit:.2f}. Streams hold their KV between "
+                    f"calls, so admitting more here would deadlock every "
+                    f"stream in flight. Retry shortly, lower "
+                    f"SGLANG_GUARD_MAX_STREAMS, or raise --mem-fraction-static. "
+                    f"The threshold is SGLANG_GUARD_ADMIT_MAX_KV_USAGE."
+                )
+                logger.warning(msg)
+                prepare_abort(
+                    req, msg, status_code=HTTPStatus.SERVICE_UNAVAILABLE
+                )
+                return req
+
+            # Keep every stream on its own branch of the radix tree.
+            #
+            # Two streams can carry byte-identical text.  If they shared a
+            # branch, a resumed call could match a cached prefix that already
+            # covers the tokens it just sent -- those tokens would not be
+            # recomputed, and the classification logits exist only for tokens
+            # computed in this forward pass (KV is cached, head outputs are
+            # not).  The call would then return fewer labels than tokens, or
+            # trip the length check in _stream_output_guard.
+            #
+            # Namespacing by rid leaves intra-stream reuse (the whole point of
+            # `resumable`) untouched: a stream only ever matches the prefix it
+            # inserted itself, which ends at most at the previous call's last
+            # token, so every newly sent token is always recomputed.
+            req.extra_key = (
+                f"guard:{recv_req.rid}"
+                if req.extra_key is None
+                else f"{req.extra_key}|guard:{recv_req.rid}"
+            )
+            # The first call wants a label for every token it sent, so no
+            # prefix may be reused: _compute_max_prefix_len turns this into a
+            # cap of 0. Leaving it None would let a cached prefix swallow part
+            # of the prompt and silently return fewer labels than tokens.
+            req.return_logprob_len = len(req.origin_input_ids)
+            self.stream_queue[recv_req.rid] = req
+            return req
+        existing_req = self.stream_queue[recv_req.rid]
+        # A paused stream holds one tree lock, taken by cache_unfinished_req
+        # when its previous call ended. This call is about to go through
+        # admission again: init_next_round_input overwrites last_node and
+        # _req_inc_lock_ref overwrites lock_receipt, after which the paused
+        # lock can never be released. Every resume leaked one lock, every
+        # stream's whole path stayed locked after it ended, and the pool
+        # filled run after run: token usage 0.98 with nothing running, then
+        # every new stream refused. Remember it so admission can hand it over.
+        if existing_req.kv.holds_kv and existing_req.last_node is not None:
+            existing_req.guard_parked_lock = (
+                existing_req.last_node,
+                existing_req.lock_receipt,
+            )
+        input_ids = recv_req.input_ids
+        if (
+            self.tokenizer is not None
+            and len(input_ids) > 0
+            and input_ids[0] == self.tokenizer.bos_token_id
+        ):
+            input_ids = input_ids[1:]
+        existing_req.origin_input_ids.extend(input_ids)
+        existing_req.return_logprob_len = len(input_ids)
+        existing_req.finished_reason = None
+        existing_req.output_ids = array("q")
+        existing_req.resumable = req.resumable
+        return existing_req
+
     def handle_generate_request(
         self,
         recv_req: TokenizedGenerateReqInput,
@@ -2789,7 +2945,19 @@ class Scheduler(
                 dllm_config=self.dllm_config,
                 time_stats=recv_req.time_stats,
                 multi_item_delimiter_indices=recv_req.multi_item_delimiter_indices,
+                resumable=recv_req.resumable,
             )
+
+            if self.is_stream_guard:
+                req = self.resume(recv_req, req)
+                if req.finished():
+                    # Admission refused: answer now, do not queue. result=None
+                    # tells the guard streamer there are no logits to slice.
+                    self.output_streamer.stream_output(
+                        [req], req.return_logprob, result=None
+                    )
+                    return
+
             req.tokenizer = self.tokenizer
 
             if radix_native_session:
@@ -3656,6 +3824,11 @@ class Scheduler(
             new_batch = prefill_plan.batch_to_run
             running_batch = prefill_plan.running_batch
 
+        if self.is_stream_guard:
+            # Guard requests never decode; nothing may carry over to the next
+            # iteration's running batch.
+            running_batch.filter_batch(keep_indices=[])
+
         need_mlp_sync = self.require_mlp_sync
         if (
             need_mlp_sync
@@ -4246,7 +4419,7 @@ class Scheduler(
         self,
         batch: ScheduleBatch,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
-    ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
+    ) -> Union[GenerationBatchResult, EmbeddingBatchResult, StreamGuardResult]:
         """Run a batch."""
         self.metrics_reporter.record_scheduler_active()
         self.forward_ct += 1
@@ -4446,6 +4619,11 @@ class Scheduler(
                 batch_result.extend_logprob_start_len_per_req = None
 
             ret = batch_result
+        elif self.is_stream_guard:
+            # Overlap scheduling is forced off for this architecture
+            # (MODEL_OVERRIDES), so only the synchronous path can be reached.
+            resolve_forward_inputs(batch, self.future_map)
+            ret = self.tp_worker.forward_stream_guard(batch)
         else:  # embedding or reward model
             if self.enable_overlap:
                 self.record_batch_in_overlap(batch)
@@ -4594,7 +4772,7 @@ class Scheduler(
     def process_batch_result(
         self,
         batch: ScheduleBatch,
-        result: Union[GenerationBatchResult, EmbeddingBatchResult],
+        result: Union[GenerationBatchResult, EmbeddingBatchResult, StreamGuardResult],
     ):
         # Flush async trace ops here: in overlap mode this CPU work runs while
         # the next batch's GPU forward is in flight, giving free overlap.
@@ -4759,7 +4937,14 @@ class Scheduler(
             and self.disagg_decode_transfer_queue.has_pending_deferred_releases()
         )
         with self.scheduler_stage_metrics.record(SCHEDULER_STAGE_SANITY_CHECK_CACHE):
-            if not self.enable_hisparse and not deferred_pending:
+            # Qwen3Guard-Stream is skipped too: resumable requests deliberately
+            # hold KV between calls while not being in the running batch, which
+            # the idle leak invariant would read as a leak.
+            if (
+                not self.enable_hisparse
+                and not deferred_pending
+                and not self.is_stream_guard
+            ):
                 has_leak, messages = self.invariant_checker._check_all_pools(
                     self.pool_stats_observer.get_pool_stats(),
                 )

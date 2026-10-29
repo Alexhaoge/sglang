@@ -34,6 +34,7 @@ from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
     BatchEmbeddingOutput,
+    BatchStreamGuardOutput,
     BatchStrOutput,
     BatchTokenIDOutput,
     ConfigureLoggingReq,
@@ -169,6 +170,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
     def init_request_dispatcher(self):
         self._request_dispatcher = TypeBasedDispatcher(
             [
+                (BatchStreamGuardOutput, self.handle_batch_stream_guard_out),
                 (BatchEmbeddingOutput, self.handle_batch_embedding_out),
                 (BatchTokenIDOutput, self.handle_batch_token_id_out),
                 (FreezeGCReq, self.handle_freeze_gc_req),
@@ -217,6 +219,10 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             # NOTE: We can always assume the last token is the matched stop token
             return output[:-1]
         return output
+
+    def handle_batch_stream_guard_out(self, recv_obj: BatchStreamGuardOutput):
+        # Guard logits need no detokenization.
+        return recv_obj
 
     def handle_batch_embedding_out(self, recv_obj: BatchEmbeddingOutput):
         # If it is embedding model, no detokenization is needed.

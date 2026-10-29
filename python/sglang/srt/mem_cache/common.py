@@ -274,6 +274,14 @@ def retraction_discard(req: Req, tree_cache: BasePrefixCache, backend: str) -> N
 
 
 def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):
+    # A resumed Qwen3Guard-Stream call that is released before admission (for
+    # example aborted in the waiting queue) still holds only its parked lock,
+    # while last_node may already point at a fresh match. Restore the pair
+    # that was actually locked so the release drops that lock and no other.
+    parked = getattr(req, "guard_parked_lock", None)
+    if parked is not None:
+        req.guard_parked_lock = None
+        req.last_node, req.lock_receipt = parked
     assert (not req.kv.holds_kv) == req.kv.is_kv_released
     # MambaRadixCache may alloc mamba state before alloc KV cache
     if not req.kv.holds_kv:

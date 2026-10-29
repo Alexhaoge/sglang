@@ -1599,7 +1599,9 @@ class ModelRunner:
             kwargs["input_embeds"][forward_batch.replace_positions] = (
                 forward_batch.replace_embeds.to(kwargs["input_embeds"].dtype)
             )
-        if not self.is_generation:
+        if not self.is_generation and (
+            "Qwen3ForGuardModel" not in self.model_config.hf_config.architectures
+        ):
             kwargs["get_embedding"] = True
         return kwargs
 

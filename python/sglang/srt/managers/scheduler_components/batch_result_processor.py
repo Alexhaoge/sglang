@@ -6,6 +6,7 @@ from http import HTTPStatus
 from typing import (
     TYPE_CHECKING,
     Callable,
+    Dict,
     List,
     Optional,
     Tuple,
@@ -14,7 +15,7 @@ from typing import (
 
 import torch
 
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.utils import DisaggregationMode, prepare_abort
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import (
     LogitsProcessorOutput,
@@ -73,6 +74,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.utils import (
         EmbeddingBatchResult,
         GenerationBatchResult,
+        StreamGuardResult,
     )
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
@@ -95,6 +97,11 @@ def _get_speculative_output_stride(result: GenerationBatchResult) -> int:
 @dataclass(kw_only=True, slots=True, frozen=True)
 class SchedulerBatchResultProcessor:
     is_generation: bool
+    # Qwen3Guard-Stream: classification-only architecture, no decode loop.
+    is_stream_guard: bool = False
+    # The Scheduler's live dict, shared by reference so resumable requests
+    # stay reachable across calls.
+    stream_queue: Optional[Dict[str, Req]] = None
     disaggregation_mode: DisaggregationMode
     enable_overlap: bool
     enable_overlap_mlx: bool
@@ -257,7 +264,7 @@ class SchedulerBatchResultProcessor:
     def process_batch_result_prefill(
         self,
         batch: ScheduleBatch,
-        result: Union[GenerationBatchResult, EmbeddingBatchResult],
+        result: Union[GenerationBatchResult, EmbeddingBatchResult, StreamGuardResult],
     ):
         skip_stream_req = None
         self.token_to_kv_pool_allocator.free_group_begin()
@@ -440,6 +447,98 @@ class SchedulerBatchResultProcessor:
                     auxiliary_output_starts,
                 )
 
+        elif self.is_stream_guard:
+            # Qwen3Guard-Stream: the logits are the output; no tokens are
+            # generated, so a dummy token ends the request after one pass.
+            for req in batch.reqs:
+                if req.is_retracted:
+                    continue
+
+                if req.inflight_middle_chunks <= 0:
+                    req.time_stats.set_prefill_finished_time()
+                    req.output_ids.append(0)
+                    req.update_finish_state()
+
+                    # Invariant: every token this call wants a label for was
+                    # computed in this pass.  _compute_max_prefix_len enforces
+                    # it by capping the prefix match, so this should never
+                    # fire -- but if it does, the missing labels cannot be
+                    # produced.  End this one stream with an error instead of
+                    # returning a short slice (silently fewer labels than
+                    # tokens) or asserting (which killed the whole scheduler).
+                    if (
+                        req.return_logprob_len is not None
+                        and req.extend_range is not None
+                        and req.return_logprob_len > req.extend_range.length
+                    ):
+                        msg = (
+                            f"guard stream {req.rid}: asked for labels of the "
+                            f"last {req.return_logprob_len} tokens but only "
+                            f"{req.extend_range.length} were computed this "
+                            f"pass; origin_len={len(req.origin_input_ids)}, "
+                            f"extra_key={req.extra_key!r}"
+                        )
+                        logger.error(msg)
+                        prepare_abort(
+                            req, msg, HTTPStatus.INTERNAL_SERVER_ERROR
+                        )
+                        # Force the release path below: a stream that cannot
+                        # answer must not stay parked holding KV.
+                        req.resumable = False
+
+                    if req.finished():
+                        if not req.resumable:
+                            release_kv_cache(req, self.tree_cache)
+                            req.time_stats.set_completion_time()
+                            if self.stream_queue is not None:
+                                self.stream_queue.pop(req.rid, None)
+                        else:
+                            # A resumable stream is paused, not done: park it
+                            # exactly like a chunked prefill between chunks.
+                            # cache_unfinished_req hands the page-aligned
+                            # prefix to the tree and frees the duplicate; the
+                            # req-pool row stays bound to this Req so the next
+                            # call for this rid reuses it (ReqToTokenPool.alloc
+                            # reuses a row whose Req still holds KV).
+                            maybe_cache_unfinished_req(req, self.tree_cache)
+
+                            # What the tree could not take is the trailing
+                            # partial page: upstream leaves it in the row and
+                            # expects the next chunk of the *same* prefill to
+                            # reuse it through req.prefix_indices.  A resumed
+                            # call does not do that -- it re-enters
+                            # init_next_round_input, which overwrites
+                            # prefix_indices from match_prefix -- so that tail
+                            # is orphaned, and nothing ever frees it.  At
+                            # page_size 128 that leaks up to a page per call:
+                            # ~168 tokens/call measured, which filled a
+                            # 159616-token pool after ~500 calls and deadlocked
+                            # the scheduler (every stream holds its KV between
+                            # calls, so there is nothing evictable left).
+                            # Release it here; the next call re-prefills those
+                            # tokens either way, so this costs no extra compute.
+                            protected = req.kv.cache_protected_len
+                            if req.kv.kv_allocated_len > protected:
+                                # protected is page-aligned (it is the length
+                                # of the tree-owned prefix), so this never
+                                # frees a page the tree still owns.
+                                self.tree_cache.free_kv_row(
+                                    req.kv, [(protected, req.kv.kv_allocated_len)]
+                                )
+                                req.kv.kv_allocated_len = protected
+                            if req.kv.kv_allocated_len == 0:
+                                # Sequence shorter than one page: the tree took
+                                # nothing and the row is now empty.  Give the
+                                # slot back so ReqKvInfo's invariant
+                                # (not holds_kv) == is_kv_released still holds.
+                                self.req_to_token_pool.free(req)
+                    else:
+                        maybe_cache_unfinished_req(req, self.tree_cache)
+                else:
+                    # being chunked reqs' prefill is not finished
+                    req.inflight_middle_chunks -= 1
+                    req.time_stats.set_last_chunked_prefill_finish_time()
+
         else:  # embedding or reward model
             if result.copy_done is not None:
                 result.copy_done.synchronize()
@@ -479,7 +578,10 @@ class SchedulerBatchResultProcessor:
 
         self.token_to_kv_pool_allocator.free_group_end()
         self.output_streamer.stream_output(
-            batch.reqs, batch.return_logprob, skip_stream_req
+            batch.reqs,
+            batch.return_logprob,
+            skip_stream_req,
+            result=result if self.is_stream_guard else None,
         )
 
         can_run_cuda_graph = result.can_run_cuda_graph

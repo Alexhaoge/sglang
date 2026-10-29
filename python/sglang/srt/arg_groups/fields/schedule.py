@@ -58,7 +58,13 @@ class Schedule(msgspec.Struct):
     ] = None
     chunked_prefill_size: A[
         Optional[int],
-        "The maximum number of tokens in a chunk for the chunked prefill. Setting this to -1 means disabling chunked prefill.",
+        Arg(
+            help="The maximum number of tokens in a chunk for the chunked prefill. Setting this to -1 means disabling chunked prefill.",
+            # Declared per-architecture by MODEL_OVERRIDES (Qwen3ForGuardModel
+            # classifies a whole prefill in one pass, so chunking must be off).
+            # The NPU backend already declares this field during resolution.
+            resolvable=True,
+        ),
     ] = None
     prefill_decode_interval: A[
         Optional[int],
