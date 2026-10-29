@@ -664,11 +664,20 @@ class ExecGraph(msgspec.Struct):
     ] = None
     disable_prefill_cuda_graph: A[
         bool,
-        "Disable the prefill-phase CUDA graph. Convenience for --cuda-graph-backend-prefill=disabled.",
+        Arg(
+            help="Disable the prefill-phase CUDA graph. Convenience for --cuda-graph-backend-prefill=disabled.",
+            # Declared per-architecture by model override providers: a model
+            # whose forward does not produce a logits tensor on the graph's
+            # static output buffer (Qwen3Guard-Stream) cannot be replayed.
+            resolvable=True,
+        ),
     ] = False
     disable_decode_cuda_graph: A[
         bool,
-        "Disable the decode-phase CUDA graph. Convenience for --cuda-graph-backend-decode=disabled.",
+        Arg(
+            help="Disable the decode-phase CUDA graph. Convenience for --cuda-graph-backend-decode=disabled.",
+            resolvable=True,
+        ),
     ] = False
     disable_cuda_graph: A[bool, Arg(no_cli=True)] = False
     disable_cuda_graph_padding: A[
