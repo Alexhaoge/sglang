@@ -40,6 +40,7 @@ from sglang.srt.arg_groups.model_overrides import muse_glimmer  # noqa: F401
 from sglang.srt.arg_groups.model_overrides import nemotron_h  # noqa: F401
 from sglang.srt.arg_groups.model_overrides import olmo2  # noqa: F401
 from sglang.srt.arg_groups.model_overrides import qwen3_5  # noqa: F401
+from sglang.srt.arg_groups.model_overrides import qwen3_guard  # noqa: F401
 from sglang.srt.arg_groups.model_overrides import qwen3_moe  # noqa: F401
 from sglang.srt.arg_groups.model_overrides import qwen3_vl  # noqa: F401
 from sglang.srt.arg_groups.model_overrides import qwen4_exp  # noqa: F401

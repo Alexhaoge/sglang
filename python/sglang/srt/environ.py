@@ -710,6 +710,15 @@ class Envs:
     SGLANG_KILLPG_ON_SCHEDULER_EXCEPTION = EnvBool(False)
     SGLANG_REQ_WAITING_TIMEOUT = EnvFloat(-1)  # in seconds
     SGLANG_REQ_RUNNING_TIMEOUT = EnvFloat(-1)  # in seconds
+    # Qwen3Guard-Stream: how many guard streams may be live at once. A stream
+    # holds its KV between calls and is not in the running batch, so it cannot
+    # be retracted or preempted: with the pool full, every stream needs KV to
+    # move forward and none can be freed, and the scheduler stops dead with no
+    # crash and /health still answering. A count cap is what keeps that
+    # reachable, because KV usage is a lagging signal -- when N streams open in
+    # the same instant the pool still reads empty and every one is admitted.
+    # Unset means no cap; set a session `timeout` on the client side as well.
+    SGLANG_GUARD_MAX_STREAMS = EnvInt(None)
     # Non-streaming requests flush intermediate outputs every N decoded tokens.
     SGLANG_FORCE_STREAM_INTERVAL = EnvInt(50)
 

@@ -1298,6 +1298,12 @@ class Req(ReqDllmMixin):
         self.return_logprob = return_logprob
         # Start index to compute logprob from.
         self.logprob_start_len = 0
+        # Qwen3Guard-Stream: how many trailing tokens the caller wants head
+        # logits for. None means "all of them". A classification head only runs
+        # on tokens computed in this forward pass, so this caps the prefix
+        # match the same way logprob_start_len does (see
+        # _compute_max_prefix_len).
+        self.return_logprob_len: Optional[int] = None
         self.logprob = ReqLogprob(
             top_logprobs_num=top_logprobs_num,
             token_ids_logprob=token_ids_logprob,
@@ -1785,6 +1791,13 @@ class Req(ReqDllmMixin):
             max_prefix_len = min(max_prefix_len, self.dllm_block_offset)
         if self.return_logprob and self.logprob_start_len >= 0:
             max_prefix_len = min(max_prefix_len, self.logprob_start_len)
+        # Qwen3Guard-Stream, for the same reason as logprob_start_len above: a
+        # classification head only runs on tokens computed in this forward
+        # pass. KV for a cached prefix is reusable, head outputs are not, so
+        # the match must stop before the tokens this call wants labels for --
+        # otherwise they are never recomputed and their labels do not exist.
+        if self.return_logprob_len is not None:
+            max_prefix_len = min(max_prefix_len, input_len - self.return_logprob_len)
         if self.is_dllm():
             # Appended masks and a partial prompt/output block are not reusable
             # KV: bidirectional attention depends on the rest of that block.

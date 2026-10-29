@@ -164,6 +164,7 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqOutput,
     MMInputsProcessError,
     OpenSessionReqInput,
+    OpenSessionReqOutput,
     PauseGenerationReqInput,
     PdRoleSwitchReqInput,
     ProfileReq,
@@ -899,6 +900,20 @@ class Scheduler(
     def init_tokenizer(self):
         server_args = self.server_args
         self.is_generation = self.model_config.is_generation
+        # Qwen3Guard-Stream: one classification pass per call, no decode loop.
+        # A call is a single prefill whose answer is the head logits; turns of
+        # the same stream are joined by a streaming session, which keeps the
+        # KV of the previous turns so a turn only prefills what it appended.
+        self.is_stream_guard = (
+            "Qwen3ForGuardModel"
+            in (self.model_config.hf_config.architectures or [])
+        )
+        if self.is_stream_guard and not self.spec_algorithm.is_none():
+            # Speculative decoding predicts the next token; a guard pass emits
+            # a label per prefill token and never decodes one.
+            raise ValueError(
+                "speculative decoding is not supported for Qwen3ForGuardModel"
+            )
 
         if self.skip_tokenizer_init:
             self.tokenizer = self.processor = None
@@ -2655,6 +2670,7 @@ class Scheduler(
             tree_cache=self.tree_cache,
             server_args=self.server_args,
             is_generation=self.is_generation,
+            is_stream_guard=self.is_stream_guard,
             spec_algorithm=self.spec_algorithm,
             disaggregation_mode=self.disaggregation_mode,
             enable_hicache_storage=lambda: (
@@ -2739,6 +2755,7 @@ class Scheduler(
         self.init_beam_coordinator()
         self.batch_result_processor = SchedulerBatchResultProcessor(
             is_generation=self.is_generation,
+            is_stream_guard=self.is_stream_guard,
             disaggregation_mode=self.disaggregation_mode,
             enable_overlap=self.enable_overlap,
             enable_overlap_mlx=self.enable_overlap_mlx,
@@ -3188,6 +3205,14 @@ class Scheduler(
             self.init_req_max_new_tokens(req)
             self._add_request_to_queue(req)
             return
+
+        if self.is_stream_guard:
+            # Labels are wanted for the tokens this call adds and nothing
+            # older: an earlier turn's KV is in the session's record, but a
+            # head output cannot be cached. _compute_max_prefix_len caps the
+            # prefix match here, so those tokens are always recomputed. A first
+            # turn has no prior turn to share with, so this is its whole prompt.
+            req.return_logprob_len = len(recv_req.input_ids)
 
         if recv_req.pp_prefetch_ticketed is True:
             self.tree_cache.bind_prefetch_ticket(req.rid)
@@ -4743,7 +4768,13 @@ class Scheduler(
                 self.maybe_send_cached_prefix_chunk(req, allow_send=not load_pending)
 
         # Run forward
-        if self.is_generation:
+        if self.is_stream_guard:
+            # The guard forward returns head logits, not next-token logits: no
+            # sampling, no relay, no graph replay, nothing to carry to a decode
+            # step. The logits ride back on the result itself.
+            resolve_forward_inputs(batch, self.future_map)
+            ret = self.tp_worker.forward_stream_guard(batch)
+        elif self.is_generation:
             if self.enable_overlap:
                 # Self-gates on batch.spec_info.future_indices; non-spec_v2
                 # no-ops (ForwardBatch.init_new lazily computes the sum).
@@ -6250,9 +6281,24 @@ class Scheduler(
         return ExpertDistributionReqOutput()
 
     def open_session(self, recv_req: OpenSessionReqInput):
-        output = self.session_controller.open(recv_req)
-        if output.success and self.enable_session_radix_cache:
-            self.tree_cache.open_radix_session(recv_req.session_id)
+        if self.is_stream_guard and self._guard_streams_full():
+            # Refusing a new stream keeps the pool draining: the streams
+            # already in flight can still finish and release. Resumed turns of
+            # an existing stream are never refused -- turning one away
+            # mid-conversation would strand the KV it already holds.
+            cap = envs.SGLANG_GUARD_MAX_STREAMS.get()
+            logger.warning(
+                f"refusing guard stream {recv_req.session_id}: "
+                f"{len(self.session_controller.sessions)} live streams, "
+                f"SGLANG_GUARD_MAX_STREAMS={cap}"
+            )
+            output = OpenSessionReqOutput(
+                session_id=recv_req.session_id, success=False
+            )
+        else:
+            output = self.session_controller.open(recv_req)
+            if output.success and self.enable_session_radix_cache:
+                self.tree_cache.open_radix_session(recv_req.session_id)
         if (
             get_parallel().pp_rank == 0
             and get_parallel().tp_rank == 0
@@ -6260,6 +6306,10 @@ class Scheduler(
         ):
             return output
         return None
+
+    def _guard_streams_full(self) -> bool:
+        cap = envs.SGLANG_GUARD_MAX_STREAMS.get()
+        return cap is not None and len(self.session_controller.sessions) >= cap
 
     def close_session(self, recv_req: CloseSessionReqInput):
         if self.enable_session_radix_cache:

@@ -83,6 +83,7 @@ from sglang.srt.managers.io_struct import (
     BaseBatchReq,
     BaseReq,
     BatchEmbeddingOutput,
+    BatchStreamGuardOutput,
     BatchStrOutput,
     BatchTokenIDOutput,
     BatchTokenizedEmbeddingReqInput,
@@ -2481,7 +2482,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 recv_obj = await async_sock_recv(self.recv_from_detokenizer)
             if isinstance(
                 recv_obj,
-                (BatchStrOutput, BatchEmbeddingOutput, BatchTokenIDOutput),
+                (
+                    BatchStrOutput,
+                    BatchEmbeddingOutput,
+                    BatchTokenIDOutput,
+                    BatchStreamGuardOutput,
+                ),
             ):
                 await self._handle_batch_output(recv_obj)
             else:
@@ -2495,6 +2501,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             BatchStrOutput,
             BatchEmbeddingOutput,
             BatchTokenIDOutput,
+            BatchStreamGuardOutput,
         ],
     ):
         if isinstance(recv_obj, (BatchStrOutput, BatchTokenIDOutput)):
@@ -2558,7 +2565,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         state.output_token_sampling_mask
                     )
 
-            if not isinstance(recv_obj, BatchEmbeddingOutput):
+            if not isinstance(
+                recv_obj, (BatchEmbeddingOutput, BatchStreamGuardOutput)
+            ):
                 meta_info.update(
                     {
                         "reasoning_tokens": recv_obj.reasoning_tokens[i],
@@ -2720,6 +2729,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     out_dict = None
                 if out_dict is not None and state.prompt_token_ids is not None:
                     out_dict["prompt_token_ids"] = state.prompt_token_ids
+            elif isinstance(recv_obj, BatchStreamGuardOutput):
+                # The head logits are the answer: one row per token this call
+                # asked a label for. There is no text and no output token.
+                meta_info["cached_tokens"] = recv_obj.cached_tokens[i]
+                out_dict = {
+                    "meta_info": meta_info,
+                    "risk_level_logits": recv_obj.risk_level_logits[i],
+                    "category_logits": recv_obj.category_logits[i],
+                    "query_risk_level_logits": recv_obj.query_risk_level_logits[i],
+                    "query_category_logits": recv_obj.query_category_logits[i],
+                }
             else:
                 assert isinstance(recv_obj, BatchEmbeddingOutput)
                 out_dict = {
@@ -2766,7 +2786,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 if self.enable_metrics:
                     completion_tokens = (
                         recv_obj.completion_tokens[i]
-                        if not isinstance(recv_obj, BatchEmbeddingOutput)
+                        if not isinstance(
+                            recv_obj, (BatchEmbeddingOutput, BatchStreamGuardOutput)
+                        )
                         else 0
                     )
                     meta_info.update(
@@ -3147,6 +3169,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             BatchStrOutput,
             BatchEmbeddingOutput,
             BatchTokenIDOutput,
+            BatchStreamGuardOutput,
         ],
         i: int,
     ) -> None:
@@ -3953,6 +3976,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             BatchStrOutput,
             BatchEmbeddingOutput,
             BatchTokenIDOutput,
+            BatchStreamGuardOutput,
         ],
         i: int,
     ) -> Dict[str, Any]:
@@ -3963,7 +3987,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             return span_attrs
 
         # Token usage attributes
-        if not isinstance(recv_obj, BatchEmbeddingOutput):
+        if not isinstance(recv_obj, (BatchEmbeddingOutput, BatchStreamGuardOutput)):
             span_attrs[SpanAttributes.GEN_AI_USAGE_COMPLETION_TOKENS] = (
                 recv_obj.completion_tokens[i]
             )

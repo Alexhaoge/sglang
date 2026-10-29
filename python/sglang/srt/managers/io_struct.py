@@ -1839,6 +1839,35 @@ class BatchEmbeddingOutput(BaseBatchReq, kw_only=True):
     pooled_hidden_states: Optional[List[Optional[torch.Tensor]]] = None
 
 
+class BatchStreamGuardOutput(BaseBatchReq, kw_only=True):
+    """Qwen3Guard-Stream classification logits for one scheduler step.
+
+    ``rids`` and ``http_worker_ipcs`` come from ``BaseBatchReq``.  Each outer
+    list is per request; its inner list covers the tokens whose logits the
+    caller asked for -- all prefill tokens on a session's first turn, only the
+    tokens appended since the previous turn afterwards -- and the innermost
+    list is that token's per-class logits.
+    """
+
+    # The finish reason
+    finished_reasons: List[Optional[FinishReasonDict]]
+
+    risk_level_logits: List[List[List[float]]]
+    category_logits: List[List[List[float]]]
+    query_risk_level_logits: List[List[List[float]]]
+    query_category_logits: List[List[List[float]]]
+
+    # Token counts
+    prompt_tokens: List[int]
+    cached_tokens: List[int]
+
+    # Number of times each request was retracted.
+    retraction_counts: Optional[List[int]] = None
+
+    # For observability; None when metrics are off.
+    time_stats: Optional[List[Optional[SchedulerOutputTimeStats]]] = None
+
+
 class ClearHiCacheReqInput(BaseReq, kw_only=True):
     pass
 
