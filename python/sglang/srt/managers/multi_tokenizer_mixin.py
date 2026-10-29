@@ -45,6 +45,7 @@ from sglang.srt.managers.io_struct import (
     BaseBatchReq,
     BaseReq,
     BatchEmbeddingOutput,
+    BatchStreamGuardOutput,
     BatchStrOutput,
     BatchTokenIDOutput,
     ConfigureLoggingReq,
@@ -286,6 +287,25 @@ def _handle_output_by_index(output, i):
                 output, "customized_info", i, check_length=False
             ),
             dp_ranks=_extract_field_by_index(output, "dp_ranks", i, check_length=False),
+        )
+    elif isinstance(output, BatchStreamGuardOutput):
+        new_output = BatchStreamGuardOutput(
+            rids=[output.rids[i]],
+            finished_reasons=_extract_field_by_index(output, "finished_reasons", i),
+            risk_level_logits=_extract_field_by_index(
+                output, "risk_level_logits", i
+            ),
+            category_logits=_extract_field_by_index(output, "category_logits", i),
+            query_risk_level_logits=_extract_field_by_index(
+                output, "query_risk_level_logits", i
+            ),
+            query_category_logits=_extract_field_by_index(
+                output, "query_category_logits", i
+            ),
+            prompt_tokens=_extract_field_by_index(output, "prompt_tokens", i),
+            cached_tokens=_extract_field_by_index(output, "cached_tokens", i),
+            retraction_counts=_extract_field_by_index(output, "retraction_counts", i),
+            time_stats=_extract_field_by_index(output, "time_stats", i),
         )
     elif isinstance(output, BatchEmbeddingOutput):
         new_output = BatchEmbeddingOutput(
