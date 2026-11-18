@@ -435,15 +435,24 @@ class MiMoVisionTransformer(nn.Module):
         seqlens = torch.repeat_interleave(
             grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]
         )
+        # Prepare the host-side cumulative lengths once per forward. The NPU FIA
+        # call consumes them as `actual_seq_lengths`; deriving them here keeps the
+        # backend from copying cu_seqlens back to the host once per block (28
+        # blocks per vision forward for MiMo-V2.5/V2.6).
+        cum_seqlens = seqlens.cumsum(dim=0)
+        actual_seq_lengths_cpu = cum_seqlens.to(torch.int32).tolist()
         cu_seqlens = torch.cat(
             [
                 torch.tensor([0], device=x.device, dtype=torch.int32),
-                seqlens.cumsum(dim=0).to(device=x.device, dtype=torch.int32),
+                cum_seqlens.to(device=x.device, dtype=torch.int32),
             ]
         )
-        max_seqlen = seqlens.max().item()
+        max_seqlen = int(seqlens.max())
         forward_metadata = prepare_vision_attention_metadata(
-            cu_seqlens, device=x.device
+            cu_seqlens,
+            device=x.device,
+            max_seqlen=max_seqlen,
+            actual_seq_lengths_cpu=actual_seq_lengths_cpu,
         )
 
         row_based_embeddings = get_position_embeddings(emb, x)

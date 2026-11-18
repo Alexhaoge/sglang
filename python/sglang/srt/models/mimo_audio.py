@@ -31,9 +31,29 @@ from sglang.srt.runtime_context import (
     get_model,
     get_parallel,
 )
-from sglang.srt.utils import is_sm90_supported
+from sglang.srt.utils import get_device, get_device_module, is_sm90_supported
 
 logger = logging.getLogger(__name__)
+
+
+def _audio_tokenizer_device() -> torch.device:
+    """The accelerator device this process runs on, as a torch.device.
+
+    The audio tokenizer has to live on the same device as the encoder that
+    consumes its output. Asking the device module first keeps an NPU process off
+    the CUDA branch, which a hardcoded ``cuda:{torch.cuda.current_device()}`` --
+    and ``get_device()``'s CUDA-first ordering on a torch_npu build that also
+    exposes a CUDA shim -- would both take.
+    """
+    device_module = get_device_module()
+    current_device = getattr(device_module, "current_device", None)
+    index = None if current_device is None else current_device()
+    device_type = str(getattr(device_module, "__name__", "")).rsplit(".", 1)[-1]
+    if device_type in ("cpu", "cuda", "npu", "xpu", "musa"):
+        return torch.device(
+            device_type if index is None else f"{device_type}:{index}"
+        )
+    return torch.device(get_device(index))
 
 
 def _mimo_local_attention_forward(
@@ -1338,9 +1358,8 @@ class AudioEncoderMixin:
                 allow_patterns=["audio_tokenizer/*"],
             )
         audio_tokenizer_path = os.path.join(model_path, "audio_tokenizer")
-        dev = torch.device(f"cuda:{torch.cuda.current_device()}")
         self.audio_tokenizer = self._load_mimo_audio_tokenizer(
-            audio_tokenizer_path, dev
+            audio_tokenizer_path, _audio_tokenizer_device()
         )
 
     @staticmethod

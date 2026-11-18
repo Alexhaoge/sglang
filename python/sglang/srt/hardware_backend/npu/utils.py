@@ -253,6 +253,16 @@ def init_npu_backend():
         torch.cuda.get_device_capability = lambda device=None: (0, 0)
     torch_npu.npu.set_compile_mode(jit_compile=False)
 
+    # The vision attention backend cannot express a window or a learnable sink.
+    # Install the NPU subclass under the same backend name so models that use
+    # either feature (MiMo-V2.5/V2.6) are computed correctly, while models that
+    # use neither keep the stock path.
+    from sglang.srt.hardware_backend.npu.attention.vision_window_attn import (
+        install_vision_window_attention,
+    )
+
+    install_vision_window_attention()
+
 
 def _is_nz_aligned(tensor: torch.Tensor) -> bool:
     """Check whether the last two dims satisfy FRACTAL_NZ alignment rules.
