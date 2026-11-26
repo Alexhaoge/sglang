@@ -71,11 +71,10 @@ def fast_image_processor_device(
     if _is_xpu:
         return "xpu"
     if _is_npu:
-        # MiMo's patch extraction builds 9-dimensional views/permutes, which
-        # aclnn rejects (8 dims max); keep its preprocessing on the CPU until a
-        # device-side layout path exists.
+        # GLM-4V and MiMo patch extraction exceed the NPU tensor dimension limit
+        # (8 dims for aclnn), so keep their preprocessing on the CPU.
         if processor.__class__.__name__ in {"Glm4vProcessor", "MiMoV2Processor"}:
-            return None
+            return "cpu"
         return "npu"
     platform = platforms.current_platform
     if not platform.is_cuda_alike():
