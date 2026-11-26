@@ -99,6 +99,11 @@ from sglang.srt.model_loader.weight_utils import (
     kv_cache_scales_loader,
 )
 from sglang.srt.models.mimo_audio import AudioEncoderMixin, MiMoAudioEncoderConfig
+from sglang.srt.models.mimo_v2_qkv_shard import (
+    ckpt_fused_qkv_rows,
+    get_ckpt_qkv_geometry,
+    replicated_fused_qkv_row_indices,
+)
 from sglang.srt.models.mimo_vl import MiMoVisionTransformer, MiMoVLVisionConfig
 from sglang.srt.models.utils import is_non_idle_and_non_empty
 from sglang.srt.multimodal.modality import Modality
@@ -127,6 +132,85 @@ _MIMO_V2_ROUTER_HPC_GEMM_MIN_M = {
 }
 
 
+def _load_replicated_fused_qkv_weight(
+    name,
+    param,
+    loaded_weight,
+    *,
+    qkv_proj: QKVParallelLinear,
+    config,
+    tp_rank: int,
+    tp_size: int,
+    ckpt_tp: int,
+    layer_is_swa=None,
+):
+    """Load one fused-qkv tensor when attention TP is wider than the interleave.
+
+    Query heads of the owning checkpoint shard are split further; that shard's
+    KV heads are replicated onto every worker of the shard. The row indices come
+    from :mod:`mimo_v2_qkv_shard`, so a per-output-channel companion tensor (a
+    ``weight_scale``) follows exactly the same layout.
+    """
+    del qkv_proj  # only the resolved rank/size are needed here
+    if loaded_weight.dim() == 0:
+        # Per-tensor companions (an input scale, a fused offset) are identical on
+        # every rank and have no rows to re-shard.
+        default_weight_loader(param, loaded_weight)
+        return
+    if "weight_scale_inv" in name:
+        raise ValueError(
+            f"MiMoV2 fused qkv_proj {name}: a block-quantized scale_inv cannot be "
+            f"re-sharded onto attention tp_size={tp_size} > checkpoint "
+            f"interleave={ckpt_tp}, because its 128-row block grid is anchored to "
+            "the checkpoint layout. Launch with attention TP "
+            f"{ckpt_tp} instead (--attn-dp-size {tp_size // ckpt_tp} at "
+            f"--tp-size {tp_size}), or convert the checkpoint to per-channel "
+            "quantization (e.g. modelslim), where the scale follows the same row "
+            "indices as the weight."
+        )
+    if config is None:
+        raise ValueError(
+            f"MiMoV2 fused qkv_proj {name}: replication needs the model config to "
+            "resolve per-layer head geometry; pass config= to "
+            "load_mimo_v2_qkv_proj_weight."
+        )
+    geometry = get_ckpt_qkv_geometry(config, name, is_swa=layer_is_swa)
+    if geometry is None:
+        raise ValueError(
+            f"MiMoV2 fused qkv_proj {name}: the parameter name does not identify a "
+            "decoder layer, so its checkpoint shard layout is unknown."
+        )
+    num_q_heads, num_kv_heads, head_dim, v_head_dim = geometry
+    expected_rows = ckpt_fused_qkv_rows(
+        num_q_heads, num_kv_heads, head_dim, v_head_dim, ckpt_tp
+    )
+    if loaded_weight.shape[0] != expected_rows:
+        raise ValueError(
+            f"MiMoV2 fused qkv_proj {name}: checkpoint has "
+            f"{loaded_weight.shape[0]} rows but a TP={ckpt_tp}-interleaved layer "
+            f"with {num_q_heads} q heads / {num_kv_heads} kv heads / head_dim "
+            f"{head_dim} (v {v_head_dim}) has {expected_rows}."
+        )
+    rows = replicated_fused_qkv_row_indices(
+        num_q_heads=num_q_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        v_head_dim=v_head_dim,
+        tp_rank=tp_rank,
+        tp_size=tp_size,
+        ckpt_tp=ckpt_tp,
+    )
+    if rows.numel() != param.shape[0]:
+        raise ValueError(
+            f"MiMoV2 fused qkv_proj {name}: selecting {rows.numel()} rows but the "
+            f"local parameter has {param.shape[0]}; attention tp_size={tp_size} "
+            f"does not match this layer's head layout."
+        )
+    default_weight_loader(
+        param, loaded_weight.index_select(0, rows.to(loaded_weight.device))
+    )
+
+
 def load_mimo_v2_qkv_proj_weight(
     name,
     param,
@@ -135,6 +219,8 @@ def load_mimo_v2_qkv_proj_weight(
     deferred_scale_inv: Optional[Dict[str, torch.Tensor]] = None,
     *,
     qkv_proj: QKVParallelLinear,
+    config=None,
+    layer_is_swa=None,
 ):
     qkv_proj = unwrap_lora_layer(qkv_proj)
     tp_rank, tp_size = get_group_rank_size(qkv_proj.tp_group)
@@ -145,10 +231,28 @@ def load_mimo_v2_qkv_proj_weight(
         return
 
     if expected_fused_tp_size is not None and expected_fused_tp_size % tp_size != 0:
-        raise ValueError(
-            f"MiMoV2 fused qkv_proj checkpoint is TP={expected_fused_tp_size}-"
-            f"interleaved; got attention tp_size={tp_size} while loading {name}."
+        # Attention TP is wider than the checkpoint interleave: split one shard's
+        # query heads further and replicate its KV heads. This is what makes
+        # attn_tp > num_key_value_heads (e.g. TP16 with no attention-DP, or
+        # --attn-dp-size 2) loadable at all.
+        if tp_size % expected_fused_tp_size != 0:
+            raise ValueError(
+                f"MiMoV2 fused qkv_proj checkpoint is TP={expected_fused_tp_size}-"
+                f"interleaved, which neither splits nor replicates over "
+                f"attention tp_size={tp_size} while loading {name}."
+            )
+        _load_replicated_fused_qkv_weight(
+            name,
+            param,
+            loaded_weight,
+            qkv_proj=qkv_proj,
+            config=config,
+            tp_rank=tp_rank,
+            tp_size=tp_size,
+            ckpt_tp=expected_fused_tp_size,
+            layer_is_swa=layer_is_swa,
         )
+        return
 
     is_scale_inv = "weight_scale_inv" in name
 
@@ -1700,6 +1804,7 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
                         expected_fused_tp_size,
                         deferred_scale_inv=deferred_qkv_scale_inv,
                         qkv_proj=self.get_submodule(name.rsplit(".", 1)[0]),
+                        config=self.config,
                     )
                 continue
 

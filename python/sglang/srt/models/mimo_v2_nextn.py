@@ -311,6 +311,10 @@ class MiMoV2MTP(MiMoV2ForCausalLM):
                             self.config
                         ),
                         qkv_proj=self.get_submodule(name.rsplit(".", 1)[0]),
+                        config=self.config,
+                        # The MTP layer is always windowed and its parameters carry
+                        # no `layers.<id>.`, so it uses the SWA head geometry.
+                        layer_is_swa=True,
                     )
                 continue
 

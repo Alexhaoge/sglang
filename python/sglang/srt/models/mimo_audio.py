@@ -26,6 +26,7 @@ from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
 from transformers.models.qwen2.modeling_qwen2 import Qwen2Model
 
 from sglang.srt.layers.attention.vision import VisionAttention
+from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.runtime_context import (
     get_model,
@@ -587,12 +588,14 @@ class AudioEncoderAttention(nn.Module):
             window_size=window_size,
             customized_position_embedding_applier=_audio_rope_applier,
             prefix="attn",
-            # TODO: the audio encoder does not follow --mm-enable-dp-encoder and
-            # reduces over the full TP group, so its output is wrong under
-            # attention DP narrower than TP. Rejecting that would reject the
-            # documented MiMo-V2.5 `--tp 8 --attn-dp-size 2` launch; fix the
-            # reduce group or run the encoder data-parallel instead.
-            allow_tp_reduce_mismatch=True,
+            # ``qkv_proj``/``proj`` shard over the attention-TP group, so the
+            # all-reduce has to run over that same group. Without this flag it
+            # reduces over the full TP group, which mixes the attention-DP groups
+            # and is wrong whenever attention TP is narrower than TP -- the
+            # documented `--tp 8 --attn-dp-size 2` launch included. With it, the
+            # layer is correct for attention-DP = 1 (the groups coincide) as well
+            # as for narrower attention TP.
+            use_dp_attention_reduce=is_dp_attention_enabled(),
         )
 
     def forward(

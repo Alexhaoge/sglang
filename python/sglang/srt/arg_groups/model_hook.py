@@ -574,22 +574,29 @@ def handle_model_specific_adjustments(server_args: Any):
                 attn_cp_size=view.attn_cp_size,
                 attn_dp_size=cfg.attn_dp_size,
             )
-            if (
-                expected_attn_tp_size is not None
-                and expected_attn_tp_size % effective_attn_tp_size != 0
-            ):
-                raise ValueError(
-                    "MiMoV2ForCausalLM requires effective attention TP "
-                    f"size {expected_attn_tp_size} because its fused "
-                    "qkv_proj weights are "
-                    f"TP={expected_attn_tp_size}-interleaved; got "
-                    f"{effective_attn_tp_size} "
-                    f"(tp_size={cfg.tp_size}, attn_dp_size={cfg.attn_dp_size}, "
-                    f"attn_cp_size={view.attn_cp_size}). "
-                    "Set --tp, --attn-dp-size, and "
-                    "--attention-context-parallel-size so the effective "
-                    f"attention TP size is {expected_attn_tp_size}."
-                )
+            if expected_attn_tp_size is not None:
+                # The fused qkv_proj is TP=<expected>-interleaved. An attention-TP
+                # width that divides it merges shards; a width that is a multiple
+                # of it splits the shard's query heads and replicates its KV
+                # heads ("fewer KV heads than workers, each worker keeps one").
+                # Only a width that fits neither direction is impossible.
+                splits = expected_attn_tp_size % effective_attn_tp_size == 0
+                replicates = effective_attn_tp_size % expected_attn_tp_size == 0
+                if not (splits or replicates):
+                    raise ValueError(
+                        "MiMoV2ForCausalLM requires an effective attention TP "
+                        f"size that divides or is a multiple of "
+                        f"{expected_attn_tp_size}, because its fused qkv_proj "
+                        f"weights are TP={expected_attn_tp_size}-interleaved; got "
+                        f"{effective_attn_tp_size} "
+                        f"(tp_size={cfg.tp_size}, attn_dp_size={cfg.attn_dp_size}, "
+                        f"attn_cp_size={view.attn_cp_size}). "
+                        "Set --tp, --attn-dp-size, and "
+                        "--attention-context-parallel-size so that the effective "
+                        f"attention TP size divides {expected_attn_tp_size} "
+                        "(merging shards) or is a multiple of it (replicating KV "
+                        "heads)."
+                    )
 
         # enable_multi_layer_eagle for EAGLE moved to the override registry
         # (arg_groups/overrides.py: _mimo_v2_overrides).
