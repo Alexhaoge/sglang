@@ -71,8 +71,9 @@ def fast_image_processor_device(
     if _is_xpu:
         return "xpu"
     if _is_npu:
-        if processor.__class__.__name__ == "Glm4vProcessor":
-            # GLM-4V patch extraction exceeds the NPU tensor dimension limit.
+        # GLM-4V and MiMo patch extraction exceed the NPU tensor dimension limit
+        # (8 dims for aclnn), so keep their preprocessing on the CPU.
+        if processor.__class__.__name__ in {"Glm4vProcessor", "MiMoV2Processor"}:
             return "cpu"
         return "npu"
     platform = platforms.current_platform
