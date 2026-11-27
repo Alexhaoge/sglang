@@ -345,6 +345,13 @@ def init_npu_backend():
 
     install_vision_window_attention()
 
+    # MiMo-V2.5/V2.6 need two hooks the model files do not provide: fused-qkv
+    # re-sharding for attention TP above the checkpoint interleave, and an
+    # audio-tokenizer device that is not hardcoded to CUDA.
+    from sglang.srt.hardware_backend.npu.mimo_v2 import install_mimo_v2_npu_support
+
+    install_mimo_v2_npu_support()
+
 
 def _is_nz_aligned(tensor: torch.Tensor) -> bool:
     """Check whether the last two dims satisfy FRACTAL_NZ alignment rules.

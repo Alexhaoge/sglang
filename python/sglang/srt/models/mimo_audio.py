@@ -25,35 +25,14 @@ from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
 from transformers.models.qwen2.modeling_qwen2 import Qwen2Model
 
 from sglang.srt.layers.attention.vision import VisionAttention
-from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.runtime_context import (
     get_model,
     get_parallel,
 )
-from sglang.srt.utils import get_device, get_device_module, is_sm90_supported
+from sglang.srt.utils import is_sm90_supported
 
 logger = logging.getLogger(__name__)
-
-
-def _audio_tokenizer_device() -> torch.device:
-    """The accelerator device this process runs on, as a torch.device.
-
-    The audio tokenizer has to live on the same device as the encoder that
-    consumes its output. Asking the device module first keeps an NPU process off
-    the CUDA branch, which a hardcoded ``cuda:{torch.cuda.current_device()}`` --
-    and ``get_device()``'s CUDA-first ordering on a torch_npu build that also
-    exposes a CUDA shim -- would both take.
-    """
-    device_module = get_device_module()
-    current_device = getattr(device_module, "current_device", None)
-    index = None if current_device is None else current_device()
-    device_type = str(getattr(device_module, "__name__", "")).rsplit(".", 1)[-1]
-    if device_type in ("cpu", "cuda", "npu", "xpu", "musa"):
-        return torch.device(
-            device_type if index is None else f"{device_type}:{index}"
-        )
-    return torch.device(get_device(index))
 
 
 def _mimo_local_attention_forward(
@@ -538,14 +517,12 @@ class AudioEncoderAttention(nn.Module):
             window_size=window_size,
             customized_position_embedding_applier=_audio_rope_applier,
             prefix="attn",
-            # ``qkv_proj``/``proj`` shard over the attention-TP group, so the
-            # all-reduce has to run over that same group. Without this flag it
-            # reduces over the full TP group, which mixes the attention-DP groups
-            # and is wrong whenever attention TP is narrower than TP -- the
-            # documented `--tp 8 --attn-dp-size 2` launch included. With it, the
-            # layer is correct for attention-DP = 1 (the groups coincide) as well
-            # as for narrower attention TP.
-            use_dp_attention_reduce=is_dp_attention_enabled(),
+            # TODO: the audio encoder does not follow --mm-enable-dp-encoder and
+            # reduces over the full TP group, so its output is wrong under
+            # attention DP narrower than TP. Rejecting that would reject the
+            # documented MiMo-V2.5 `--tp 8 --attn-dp-size 2` launch; fix the
+            # reduce group or run the encoder data-parallel instead.
+            allow_tp_reduce_mismatch=True,
         )
 
     def forward(
@@ -1198,8 +1175,9 @@ class AudioEncoderMixin:
                 allow_patterns=["audio_tokenizer/*"],
             )
         audio_tokenizer_path = os.path.join(model_path, "audio_tokenizer")
+        dev = torch.device(f"cuda:{torch.cuda.current_device()}")
         self.audio_tokenizer = self._load_mimo_audio_tokenizer(
-            audio_tokenizer_path, _audio_tokenizer_device()
+            audio_tokenizer_path, dev
         )
 
     @staticmethod
